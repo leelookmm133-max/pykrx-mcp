@@ -31,6 +31,7 @@ import pandas as pd
 from pykrx import stock
 
 import indicators          # 같은 폴더. 지표 계산을 서버에서 수행
+import screener            # 같은 폴더. 전종목 조건 스크리너
 
 # MCP SDK 2.x 에서 FastMCP 가 MCPServer 로 이름이 바뀌었습니다.
 # 어느 버전이 깔려도 돌아가게 둘 다 시도합니다.
@@ -508,6 +509,43 @@ def get_etf_detail(code: str, days: int = 20) -> dict[str, Any]:
             out[key], out[f"{key}_error"] = [], str(e)
 
     return out
+
+
+
+@mcp.tool()
+def screen_volume_breakout(
+    min_cap_억: float = 1000,
+    vol_mult: float = 2.0,
+    min_days: int = 3,
+    ret_lo_pct: float = -3.0,
+    ret_hi_pct: float = 5.0,
+    dd_max_pct: float = -10.0,
+    require_flow: bool = True,
+    max_results: int = 30,
+) -> dict[str, Any]:
+    """
+    전종목 스크리너: 거래량은 늘었지만 주가는 아직 안 움직인 종목을 찾습니다.
+
+    조건(기본값):
+      - 시가총액 min_cap_억(1000억) 이상
+      - 20일 평균(최근 5일 제외) 대비 vol_mult(2배) 이상 거래량이 최근 5거래일 중 min_days(3)일 이상
+      - 20일 등락률 ret_lo_pct(-3%) ~ ret_hi_pct(+5%)
+      - 60일 종가 고점 대비 dd_max_pct(-10%) 이내
+      - 외국인 또는 기관 20일 누적 순매수 > 0 (require_flow)
+    결과에는 통과 종목(passed)과 조건 1개만 못 미친 종목(near_miss)이 함께 옵니다.
+    첫 실행은 KRX 60거래일치를 받느라 1~3분 걸릴 수 있습니다. 결과는 사실 집계이며 매매 권유가 아닙니다.
+    """
+    return screener.run_screen(
+        min_cap_억=min_cap_억, vol_mult=vol_mult, min_days=int(min_days),
+        ret_lo_pct=ret_lo_pct, ret_hi_pct=ret_hi_pct, dd_max_pct=dd_max_pct,
+        require_flow=require_flow, max_results=int(max_results),
+    )
+
+
+@mcp.tool()
+def screener_cache_status() -> dict[str, Any]:
+    """스크리너 캐시 상태(받아둔 거래일 수, 백그라운드 준비 진행률)를 확인합니다."""
+    return screener.cache_status()
 
 
 @mcp.tool()
