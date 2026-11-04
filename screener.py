@@ -9,7 +9,7 @@ server.py 가 import 해서 MCP 도구로 노출합니다.
   2. 20일 등락률: ret_lo(-3%) ~ ret_hi(+5%)
   3. 60일 고점(종가) 대비 현재가: dd_max(-10%) 이내
   4. 수급: 외국인 또는 기관의 20일 누적 순매수 > 0 (require_flow=True 일 때)
-  5. 시가총액 >= min_cap_억(1000)
+  5. 시가총액 >= min_cap_eok(1000, 단위 억원)
 
 데이터는 KRX 전종목 일별 OHLCV 를 날짜별로 받아 메모리에 캐시합니다.
 첫 실행은 60거래일치를 받아야 해서 1~3분 걸릴 수 있고, 이후엔 새 거래일만 추가로 받습니다.
@@ -83,8 +83,16 @@ def _market_ohlcv_one_day(ymd: str) -> pd.DataFrame:
     return df[keep].copy()
 
 
-def _ensure_days(n_days: int, max_calendar_back: int = 130) -> list[str]:
-    """최근 n_days 거래일의 날짜 목록(오름차순)을 캐시에 채우고 반환."""
+def _ensure_days(n_days: int, max_calendar_back: int | None = None) -> list[str]:
+    """최근 n_days 거래일의 날짜 목록(오름차순)을 캐시에 채우고 반환.
+
+    max_calendar_back 은 무한 루프 방지용 안전 상한(달력일)입니다. 거래일은 달력일의
+    약 2/3 (주말 + 연 15일 안팎 휴장) 이므로 n_days 에 비례해 잡습니다.
+    ⚠️ 예전엔 130 고정이어서 125거래일을 요청해도 87일(주중 93일 − 휴장 6일)에서
+       끊겼습니다 (실측 2026-11-05: prefetch target=125, done=87, 에러 없음).
+    """
+    if max_calendar_back is None:
+        max_calendar_back = int(n_days * 1.6) + 30   # 125일 → 230, 60일 → 126
     dates: list[str] = []
     d = _today()
     # 장 마감(15:30) 전이면 당일 데이터가 불완전하므로 전일부터
@@ -262,7 +270,7 @@ def screen_frame(panel_close: pd.DataFrame, panel_vol: pd.DataFrame,
 # ────────────────────────────────────────────────────────────
 # 공개 API
 # ────────────────────────────────────────────────────────────
-def run_screen(min_cap_억: float = 1000, vol_mult: float = 2.0, min_days: int = 3,
+def run_screen(min_cap_eok: float = 1000, vol_mult: float = 2.0, min_days: int = 3,
                ret_lo_pct: float = -3.0, ret_hi_pct: float = 5.0, dd_max_pct: float = -10.0,
                require_flow: bool = True, lookback_days: int = 60,
                max_results: int = 30, include_near: bool = True) -> dict[str, Any]:
@@ -289,7 +297,7 @@ def run_screen(min_cap_억: float = 1000, vol_mult: float = 2.0, min_days: int =
 
     passed, near = screen_frame(
         panel_close, panel_vol, caps, foreign, inst,
-        min_cap_won=min_cap_억 * 1e8, vol_mult=vol_mult, min_days=min_days,
+        min_cap_won=min_cap_eok * 1e8, vol_mult=vol_mult, min_days=min_days,
         ret_lo=ret_lo_pct / 100, ret_hi=ret_hi_pct / 100, dd_max=dd_max_pct / 100,
         require_flow=require_flow and flow_ok, names=names,
     )
@@ -302,7 +310,7 @@ def run_screen(min_cap_억: float = 1000, vol_mult: float = 2.0, min_days: int =
         "as_of": f"{last[:4]}-{last[4:6]}-{last[6:]}",
         "universe_days": len(dates),
         "conditions": {
-            "시가총액_억_이상": min_cap_억,
+            "시가총액_억_이상": min_cap_eok,
             "거래량": f"20일평균(최근5일 제외) 대비 {vol_mult}배 이상이 최근 5일 중 {min_days}일 이상",
             "20일등락률_pct": [ret_lo_pct, ret_hi_pct],
             "60일고점대비_pct_이내": dd_max_pct,
@@ -357,7 +365,7 @@ def momentum_score(m: dict[str, Any], f: float, i: float) -> tuple[int, dict[str
     return sum(checks.values()), checks
 
 
-def run_momentum(min_cap_억: float = 1000, min_score: int = 4, max_results: int = 20,
+def run_momentum(min_cap_eok: float = 1000, min_score: int = 4, max_results: int = 20,
                  exclude_overheated_pct: float = 40.0) -> dict[str, Any]:
     """규칙 기반 모멘텀 점수(0~6) 상위 종목. exclude_overheated_pct: 20일 수익률이 이보다 크면 과열로 제외."""
     t0 = time.time()
@@ -376,7 +384,7 @@ def run_momentum(min_cap_억: float = 1000, min_score: int = 4, max_results: int
     rows = []
     for t in panel_close.columns:
         cap = float(caps.get(t, 0.0)) if caps is not None else 0.0
-        if caps is not None and cap < min_cap_억 * 1e8:
+        if caps is not None and cap < min_cap_eok * 1e8:
             continue
         m = momentum_metrics(panel_close[t].dropna(), panel_val[t].dropna() if panel_val is not None else None)
         if m is None:
