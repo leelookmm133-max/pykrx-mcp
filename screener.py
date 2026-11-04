@@ -317,7 +317,104 @@ def run_screen(min_cap_억: float = 1000, vol_mult: float = 2.0, min_days: int =
     }
 
 
-def prefetch(days: int = 65) -> None:
+# ────────────────────────────────────────────────────────────
+# 모멘텀 스크리너 (규칙 기반 점수, 예측 아님)
+# ────────────────────────────────────────────────────────────
+def momentum_metrics(close: pd.Series, value: pd.Series | None, lookback: int = 120) -> dict[str, Any] | None:
+    """close/value(거래대금) 는 날짜 오름차순. 최소 61일 필요."""
+    if len(close) < 61:
+        return None
+    c = close.astype(float).values
+    last = c[-1]
+    if last <= 0:
+        return None
+    def ret(n):
+        return last / c[-(n + 1)] - 1.0 if len(c) > n else None
+    r20, r60 = ret(20), ret(60)
+    r120 = ret(120) if len(c) > 120 else None
+    ma20 = float(c[-20:].mean()); ma60 = float(c[-60:].mean())
+    high = float(c[-min(len(c), 250):].max())
+    near_high = last / high - 1.0
+    tv_ratio = None
+    if value is not None and len(value) >= 80:
+        v = value.astype(float).values
+        prev = float(v[-80:-20].mean())
+        tv_ratio = float(v[-20:].mean()) / prev if prev > 0 else None
+    return {"close": last, "r20": r20, "r60": r60, "r120": r120,
+            "above_ma": last > ma20 > ma60, "near_high": near_high, "tv_ratio": tv_ratio}
+
+
+def momentum_score(m: dict[str, Any], f: float, i: float) -> tuple[int, dict[str, bool]]:
+    checks = {
+        "60일수익률>10%": (m["r60"] or 0) > 0.10,
+        "20일수익률>0": (m["r20"] or 0) > 0,
+        "정배열(종가>20일선>60일선)": bool(m["above_ma"]),
+        "52주고점-5%이내": m["near_high"] >= -0.05,
+        "거래대금증가(20일>직전60일)": (m["tv_ratio"] or 0) > 1.0,
+        "외국인또는기관20일순매수": (f > 0 or i > 0),
+    }
+    checks = {k: bool(v) for k, v in checks.items()}
+    return sum(checks.values()), checks
+
+
+def run_momentum(min_cap_억: float = 1000, min_score: int = 4, max_results: int = 20,
+                 exclude_overheated_pct: float = 40.0) -> dict[str, Any]:
+    """규칙 기반 모멘텀 점수(0~6) 상위 종목. exclude_overheated_pct: 20일 수익률이 이보다 크면 과열로 제외."""
+    t0 = time.time()
+    dates = _ensure_days(125)
+    if len(dates) < 61:
+        return {"ok": False, "error": f"거래일 데이터 부족 ({len(dates)}일).", "prefetch": _prefetch_state}
+    with _lock:
+        frames = {d: _ohlcv_by_date[d] for d in dates}
+    panel_close = pd.DataFrame({d: f["종가"] for d, f in frames.items()}).T.sort_index()
+    panel_val = (pd.DataFrame({d: f["거래대금"] for d, f in frames.items() if "거래대금" in f.columns}).T.sort_index()
+                 if all("거래대금" in f.columns for f in frames.values()) else None)
+    last = dates[-1]
+    caps_df = _market_caps(last)
+    caps = caps_df["시가총액"].astype(float).rename(index=str) if "시가총액" in caps_df.columns else None
+    foreign, inst, names = _flows(dates[-20], last)
+    rows = []
+    for t in panel_close.columns:
+        cap = float(caps.get(t, 0.0)) if caps is not None else 0.0
+        if caps is not None and cap < min_cap_억 * 1e8:
+            continue
+        m = momentum_metrics(panel_close[t].dropna(), panel_val[t].dropna() if panel_val is not None else None)
+        if m is None:
+            continue
+        if (m["r20"] or 0) * 100 > exclude_overheated_pct:
+            continue
+        f, i = float(foreign.get(t, 0.0)), float(inst.get(t, 0.0))
+        score, checks = momentum_score(m, f, i)
+        if score < min_score:
+            continue
+        rows.append({
+            "code": t, "name": names.get(t, t), "close": int(m["close"]), "cap_억": round(cap / 1e8) if cap else None,
+            "score": score,
+            "ret20_pct": round(float(m["r20"]) * 100, 1), "ret60_pct": round(float(m["r60"]) * 100, 1),
+            "ret120_pct": round(float(m["r120"]) * 100, 1) if m["r120"] is not None else None,
+            "from_52w_high_pct": round(float(m["near_high"]) * 100, 1),
+            "turnover_ratio_20v60": round(float(m["tv_ratio"]), 2) if m["tv_ratio"] else None,
+            "foreign20_억": round(f / 1e8, 1), "inst20_억": round(i / 1e8, 1),
+            "checks": {k: bool(v) for k, v in checks.items()},
+        })
+    rows.sort(key=lambda r: (-r["score"], -(r["ret60_pct"] or 0)))
+    for r in rows[:max_results]:
+        if r["name"] == r["code"]:
+            r["name"] = _name(r["code"], names)
+    return {
+        "ok": True, "as_of": f"{last[:4]}-{last[4:6]}-{last[6:]}",
+        "method": "규칙 기반 모멘텀 점수(6개 조건 충족 수). 예측이 아니라 현재 상태의 분류입니다.",
+        "conditions": ["60일 수익률 > 10%", "20일 수익률 > 0", "종가 > 20일선 > 60일선", "52주 고점 대비 -5% 이내",
+                       "20일 평균 거래대금 > 직전 60일 평균", "외국인 또는 기관 20일 순매수 > 0",
+                       f"과열 제외: 20일 수익률 > {exclude_overheated_pct}%"],
+        "count": len(rows), "results": rows[:max_results],
+        "elapsed_sec": round(time.time() - t0, 1),
+        "note": "모멘텀 전략은 상승장에서 유리하고 추세 전환기에 큰 손실이 날 수 있습니다. 매매 권유가 아닙니다.",
+        "source": "KRX via pykrx",
+    }
+
+
+def prefetch(days: int = 125) -> None:
     """서버 시작 시 백그라운드로 캐시를 채웁니다."""
     if _prefetch_state["running"]:
         return

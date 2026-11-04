@@ -543,6 +543,20 @@ def screen_volume_breakout(
 
 
 @mcp.tool()
+def screen_momentum(min_cap_억: float = 1000, min_score: int = 4, max_results: int = 20,
+                    exclude_overheated_pct: float = 40.0) -> dict[str, Any]:
+    """
+    규칙 기반 모멘텀 스크리너 (예측 아님). 6개 조건 충족 수(0~6)로 점수화해 상위 종목을 보여줍니다:
+    60일 수익률>10%, 20일 수익률>0, 정배열(종가>20일선>60일선), 52주 고점 -5% 이내,
+    20일 평균 거래대금 > 직전 60일 평균, 외국인 또는 기관 20일 순매수.
+    20일 수익률이 exclude_overheated_pct(40%)를 넘는 과열 종목은 제외합니다.
+    결과는 현재 상태의 분류이며 매매 권유가 아닙니다.
+    """
+    return screener.run_momentum(min_cap_억=min_cap_억, min_score=int(min_score),
+                                 max_results=int(max_results), exclude_overheated_pct=exclude_overheated_pct)
+
+
+@mcp.tool()
 def screener_cache_status() -> dict[str, Any]:
     """스크리너 캐시 상태(받아둔 거래일 수, 백그라운드 준비 진행률)를 확인합니다."""
     return screener.cache_status()
