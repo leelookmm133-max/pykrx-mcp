@@ -512,10 +512,6 @@ def get_etf_detail(code: str, days: int = 20) -> dict[str, Any]:
 
 
 
-# ⚠️ MCP 도구의 파라미터 이름은 영문·숫자·`_ . -` 만 허용됩니다 (Claude API 규칙
-#    `^[a-zA-Z0-9_.-]{1,64}$`). 이름에 한글(예: '억')이 섞이면 그 파라미터만이 아니라
-#    **도구 전체가 Claude 세션에서 제외**됩니다 (실측 2026-11-05: screen_* 두 개 누락).
-#    응답 JSON 의 키(cap_억 등)는 이 규칙과 무관하므로 그대로 둡니다.
 @mcp.tool()
 def screen_volume_breakout(
     min_cap_eok: float = 1000,
@@ -540,7 +536,7 @@ def screen_volume_breakout(
     첫 실행은 KRX 60거래일치를 받느라 1~3분 걸릴 수 있습니다. 결과는 사실 집계이며 매매 권유가 아닙니다.
     """
     return screener.run_screen(
-        min_cap_eok=min_cap_eok, vol_mult=vol_mult, min_days=int(min_days),
+        min_cap_억=min_cap_eok, vol_mult=vol_mult, min_days=int(min_days),
         ret_lo_pct=ret_lo_pct, ret_hi_pct=ret_hi_pct, dd_max_pct=dd_max_pct,
         require_flow=require_flow, max_results=int(max_results),
     )
@@ -554,11 +550,25 @@ def screen_momentum(min_cap_eok: float = 1000, min_score: int = 4, max_results: 
     60일 수익률>10%, 20일 수익률>0, 정배열(종가>20일선>60일선), 52주 고점 -5% 이내,
     20일 평균 거래대금 > 직전 60일 평균, 외국인 또는 기관 20일 순매수.
     20일 수익률이 exclude_overheated_pct(40%)를 넘는 과열 종목은 제외합니다.
-    min_cap_eok 는 시가총액 하한(억원, 기본 1000).
     결과는 현재 상태의 분류이며 매매 권유가 아닙니다.
     """
-    return screener.run_momentum(min_cap_eok=min_cap_eok, min_score=int(min_score),
+    return screener.run_momentum(min_cap_억=min_cap_eok, min_score=int(min_score),
                                  max_results=int(max_results), exclude_overheated_pct=exclude_overheated_pct)
+
+
+@mcp.tool()
+def backtest_volume_breakout(min_cap_eok: float = 1000, vol_mult: float = 2.0, min_days: int = 3,
+                             ret_lo_pct: float = -3.0, ret_hi_pct: float = 5.0, dd_max_pct: float = -10.0,
+                             hold_days: int = 20, step: int = 1, require_flow: bool = False) -> dict[str, Any]:
+    """
+    거래량 급증·주가 미반영 조건의 백테스트. 캐시된 약 125거래일 중 60일째부터 매 거래일(step) 조건을 적용해
+    통과 종목의 hold_days 뒤 수익률, 승률, KOSPI 대비 초과수익, 보유 중 최고/최저를 집계합니다.
+    require_flow=True 면 날짜별 수급 조회가 들어가 수 분 걸릴 수 있습니다(기본 False).
+    결과는 과거 통계이며 매매 권유가 아닙니다.
+    """
+    return screener.run_backtest(min_cap_억=min_cap_eok, vol_mult=vol_mult, min_days=int(min_days),
+                                 ret_lo_pct=ret_lo_pct, ret_hi_pct=ret_hi_pct, dd_max_pct=dd_max_pct,
+                                 hold_days=int(hold_days), step=int(step), require_flow=require_flow)
 
 
 @mcp.tool()
