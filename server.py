@@ -559,21 +559,43 @@ def screen_momentum(min_cap_eok: float = 1000, min_score: int = 4, max_results: 
 @mcp.tool()
 def backtest_volume_breakout(min_cap_eok: float = 1000, vol_mult: float = 2.0, min_days: int = 3,
                              ret_lo_pct: float = -3.0, ret_hi_pct: float = 5.0, dd_max_pct: float = -10.0,
-                             hold_days: int = 20, step: int = 1, require_flow: bool = False) -> dict[str, Any]:
+                             hold_days: int = 20, lookback_days: int = 250, horizons: str = "5,10,20,40",
+                             step: int = 1, require_flow: bool = False, cap_mode: str = "scaled",
+                             cooldown: int = 20, max_signals_listed: int = 40) -> dict[str, Any]:
     """
-    거래량 급증·주가 미반영 조건의 백테스트. 캐시된 약 125거래일 중 60일째부터 매 거래일(step) 조건을 적용해
-    통과 종목의 hold_days 뒤 수익률, 승률, KOSPI 대비 초과수익, 보유 중 최고/최저를 집계합니다.
-    require_flow=True 면 날짜별 수급 조회가 들어가 수 분 걸릴 수 있습니다(기본 False).
-    결과는 과거 통계이며 매매 권유가 아닙니다.
+    거래량 급증·주가 미반영 조건(screen_volume_breakout 과 같은 정의)의 백테스트.
+
+    최근 lookback_days(기본 250거래일 ≈ 1년) 중 60일째부터 매 거래일(step) 조건을 적용해, 통과 종목의
+    horizons(기본 5,10,20,40일) 뒤 수익률·승률·중앙값, 시장지수(종목별 KOSPI/KOSDAQ) 대비 초과수익,
+    같은 날 시총 조건을 만족한 전종목 평균(universe) 대비 성과, 보유 중 최고/최저를 집계합니다.
+    hold_days 는 월별·지속일별·개별 신호 상세에 쓰는 기준 보유기간입니다.
+    같은 종목의 연속 신호(중복 표본)를 뺀 첫 신호만의 집계는 entries_by_horizon 에 있습니다(cooldown 거래일 기준).
+    cap_mode="scaled"(기본) 는 최신 시총을 신호일 가격으로 환산해 미래참조 편향을 줄입니다. "latest" 는 최신 시총 고정.
+
+    캐시가 lookback_days 보다 적으면 백그라운드로 받기 시작하고 status="preparing" 을 바로 돌려주므로,
+    screener_cache_status 로 진행률을 본 뒤 다시 호출하세요(하루당 1~2초, 1년치 약 5~8분).
+    require_flow=True 면 신호일마다 수급(외국인·기관 20일 순매수)을 추가로 받아야 해서 status="preparing_flows" 가
+    먼저 올 수 있습니다. 결과는 과거 통계이며 매매 권유가 아닙니다.
     """
     return screener.run_backtest(min_cap_억=min_cap_eok, vol_mult=vol_mult, min_days=int(min_days),
                                  ret_lo_pct=ret_lo_pct, ret_hi_pct=ret_hi_pct, dd_max_pct=dd_max_pct,
-                                 hold_days=int(hold_days), step=int(step), require_flow=require_flow)
+                                 hold_days=int(hold_days), step=int(step), require_flow=require_flow,
+                                 max_signals_listed=int(max_signals_listed), lookback_days=int(lookback_days),
+                                 horizons=horizons, cap_mode=cap_mode, cooldown=int(cooldown))
+
+
+@mcp.tool()
+def screener_prefetch(days: int = 250) -> dict[str, Any]:
+    """전종목 일별 데이터를 days 거래일만큼 백그라운드로 미리 받아 둡니다(백테스트 기간 확장용, 최대 500).
+    바로 돌아오며, 진행률은 screener_cache_status 로 확인합니다."""
+    days = max(60, min(int(days), 500))
+    screener.prefetch(days)
+    return {"ok": True, "requested_days": days, **screener.cache_status()}
 
 
 @mcp.tool()
 def screener_cache_status() -> dict[str, Any]:
-    """스크리너 캐시 상태(받아둔 거래일 수, 백그라운드 준비 진행률)를 확인합니다."""
+    """스크리너 캐시 상태(받아둔 거래일 수·기간, 백그라운드 준비 진행률, 수급 캐시)를 확인합니다."""
     return screener.cache_status()
 
 
