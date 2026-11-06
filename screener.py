@@ -535,6 +535,51 @@ def _name_map(ymd: str) -> dict[str, str]:
     return _name_cache
 
 
+# ────────────────────────────────────────────────────────────
+# 밸류에이션(PER·PBR) — 20거래일마다 한 번 받아 앞으로 채움(ffill)
+# ────────────────────────────────────────────────────────────
+_fund_cache: dict[str, pd.DataFrame] = {}
+
+
+def _fundamental_one_day(ymd: str) -> pd.DataFrame:
+    if ymd in _fund_cache:
+        return _fund_cache[ymd]
+    fn = getattr(stock, "get_market_fundamental", None) or getattr(stock, "get_market_fundamental_by_ticker", None)
+    df = pd.DataFrame()
+    if fn is not None:
+        try:
+            df = _retry(fn, ymd, market="ALL")
+        except TypeError:
+            df = _retry(fn, ymd, "ALL")
+        except Exception as e:  # noqa: BLE001
+            log.warning("펀더멘털 조회 실패 %s: %s", ymd, e)
+    if df is None:
+        df = pd.DataFrame()
+    keep = [c for c in ("PER", "PBR", "EPS", "BPS", "DIV") if c in df.columns]
+    df = df[keep].copy() if keep else pd.DataFrame()
+    df.index = [str(i) for i in df.index]
+    _fund_cache[ymd] = df
+    return df
+
+
+def fundamental_panels(dates: list[str], tickers, every: int = 20) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """행=날짜(dates), 열=티커의 PER·PBR 패널. every 거래일마다 받은 값을 앞으로 채운다."""
+    sample = list(dates[::every])
+    if dates[-1] not in sample:
+        sample.append(dates[-1])
+    per = pd.DataFrame(float("nan"), index=dates, columns=list(tickers))
+    pbr = pd.DataFrame(float("nan"), index=dates, columns=list(tickers))
+    for d in sample:
+        f = _fundamental_one_day(d)
+        if f.empty:
+            continue
+        if "PER" in f.columns:
+            per.loc[d] = f["PER"].reindex(per.columns).astype(float).values
+        if "PBR" in f.columns:
+            pbr.loc[d] = f["PBR"].reindex(pbr.columns).astype(float).values
+    return per.ffill().bfill(), pbr.ffill().bfill()
+
+
 def _parse_horizons(horizons: Any, hold_days: int) -> list[int]:
     if horizons is None or horizons == "":
         hs = [5, 10, 20, 40]
@@ -550,7 +595,9 @@ def _parse_horizons(horizons: Any, hold_days: int) -> list[int]:
 def signal_matrix(panel_close: pd.DataFrame, panel_vol: pd.DataFrame, *,
                   vol_mult: float, min_days: int, ret_lo: float, ret_hi: float, dd_max: float,
                   lookback_ret: int = 20, lookback_high: int = 60,
-                  base_window: int = 20, recent_window: int = 5) -> dict[str, pd.DataFrame]:
+                  base_window: int = 20, recent_window: int = 5,
+                  mode: str = "spike", accum_mult: float = 1.5, max_spike: float = 5.0,
+                  accum_window: int = 20, accum_base: int = 60) -> dict[str, pd.DataFrame]:
     """compute_metrics 와 같은 정의를 패널 전체에 벡터화. 반환값은 모두 panel 과 같은 모양.
 
     - base: 최근 recent_window 일을 제외한 직전 base_window 일 평균 거래량
@@ -570,6 +617,19 @@ def signal_matrix(panel_close: pd.DataFrame, panel_vol: pd.DataFrame, *,
     high = c.rolling(lookback_high, min_periods=lookback_high).max()
     dd = c / high - 1.0
     today_ratio = v / base
+    if str(mode).lower().startswith("accum"):
+        # 누적 매집형: 최근 accum_window 일 평균 거래량이 그 이전 accum_base 일 평균의 accum_mult 배 이상이면서,
+        # 그 기간 안에 하루 max_spike 배 이상 폭발한 날은 없음(뉴스·테마 반응 제외). 완만하게 쌓인 거래량만 잡는다.
+        base_long = v.shift(accum_window).rolling(accum_base, min_periods=accum_base).mean()
+        recent_avg = v.rolling(accum_window, min_periods=accum_window).mean()
+        accum_ratio = recent_avg / base_long
+        daily_ratio = v / base_long
+        max_spike_ratio = daily_ratio.rolling(accum_window, min_periods=accum_window).max()
+        valid = base_long.notna() & (base_long > 0) & high.notna() & ret.notna() & (c > 0) & accum_ratio.notna()
+        ok = valid & (accum_ratio >= accum_mult) & (max_spike_ratio < max_spike) \
+            & (ret >= ret_lo) & (ret <= ret_hi) & (dd >= dd_max)
+        return {"ok": ok, "valid": valid, "spike_days": spike, "ret": ret, "dd": dd, "today_ratio": today_ratio,
+                "accum_ratio": accum_ratio, "max_spike_ratio": max_spike_ratio}
     valid = base.notna() & (base > 0) & high.notna() & ret.notna() & (c > 0)
     ok = valid & (spike >= min_days) & (ret >= ret_lo) & (ret <= ret_hi) & (dd >= dd_max)
     return {"ok": ok, "valid": valid, "spike_days": spike, "ret": ret, "dd": dd, "today_ratio": today_ratio}
@@ -613,7 +673,10 @@ def _flows_for_dates(dates: list[str], idx_list: list[int]) -> None:
 
 def _signal_context(*, min_cap_억: float, vol_mult: float, min_days: int, ret_lo_pct: float, ret_hi_pct: float,
                     dd_max_pct: float, lookback_days: int, min_forward: int, step: int, require_flow: bool,
-                    cap_mode: str, cooldown: int, need_ohlc: bool = False) -> dict[str, Any]:
+                    cap_mode: str, cooldown: int, need_ohlc: bool = False,
+                    mode: str = "spike", accum_mult: float = 1.5, max_spike: float = 5.0,
+                    per_max: float | None = None, pbr_max: float | None = None,
+                    flow_mode: str = "any") -> dict[str, Any]:
     """백테스트 공통 준비: 캐시 확인 → 패널 → 시총 → 조건 행렬 → (수급) → 첫 신호.
 
     준비가 안 됐으면 {"ok": False, "status": ...} 를, 됐으면 {"ok": True, ...패널과 행렬...} 을 돌려준다.
@@ -681,9 +744,23 @@ def _signal_context(*, min_cap_억: float, vol_mult: float, min_days: int, ret_l
 
     # 3) 조건 행렬
     sm = signal_matrix(panel_close, panel_vol, vol_mult=vol_mult, min_days=int(min_days),
-                       ret_lo=ret_lo_pct / 100, ret_hi=ret_hi_pct / 100, dd_max=dd_max_pct / 100)
+                       ret_lo=ret_lo_pct / 100, ret_hi=ret_hi_pct / 100, dd_max=dd_max_pct / 100,
+                       mode=mode, accum_mult=accum_mult, max_spike=max_spike)
     ok = sm["ok"] & cap_ok
     universe = sm["valid"] & cap_ok
+    # 3b) 저평가 조건(선택): PER·PBR 상한. 적자(PER<=0)·자본잠식(PBR<=0) 제외. 유니버스에도 같이 적용해 공정 비교.
+    val_note = "미적용"
+    per_panel = pbr_panel = None
+    if per_max is not None or pbr_max is not None:
+        per_panel, pbr_panel = fundamental_panels(dates, tickers)
+        val_ok = pd.DataFrame(True, index=panel_close.index, columns=tickers)
+        if per_max is not None:
+            val_ok &= (per_panel > 0) & (per_panel <= float(per_max))
+        if pbr_max is not None:
+            val_ok &= (pbr_panel > 0) & (pbr_panel <= float(pbr_max))
+        ok = ok & val_ok
+        universe = universe & val_ok
+        val_note = f"적용(PER 0~{per_max}, PBR 0~{pbr_max}; 20거래일 간격 갱신)"
 
     # 신호일 범위: 60일째부터(지표 계산에 60일 필요), step 간격
     sig_idx = list(range(59, len(dates), max(1, int(step))))
@@ -708,29 +785,40 @@ def _signal_context(*, min_cap_억: float, vol_mult: float, min_days: int, ret_l
             f, ins = _flow_cache[(dates[i - 19], dates[i])]
             fl = f.reindex(tickers).fillna(0.0)
             il = ins.reindex(tickers).fillna(0.0)
-            ok.iloc[i] = ok.iloc[i].values & ((fl > 0) | (il > 0)).values
-        flow_note = "적용(외국인 또는 기관 20일 누적 순매수 > 0)"
+            if str(flow_mode).lower() == "both":
+                ok.iloc[i] = ok.iloc[i].values & ((fl > 0) & (il > 0)).values
+            else:
+                ok.iloc[i] = ok.iloc[i].values & ((fl > 0) | (il > 0)).values
+        flow_note = ("적용(외국인 그리고 기관 20일 누적 순매수 > 0)" if str(flow_mode).lower() == "both"
+                     else "적용(외국인 또는 기관 20일 누적 순매수 > 0)")
 
     # 5) 첫 신호(entries): 직전 cooldown 거래일 안에 신호가 없었던 경우
     okf = ok.astype(float)
     prev = okf.rolling(int(cooldown), min_periods=1).sum().shift(1).fillna(0.0)
     entry = ok & (prev == 0)
 
-    conditions = {"시가총액_억_이상": min_cap_억, "시가총액_기준": "신호일 가격으로 환산" if cap_mode == "scaled" else "최신 고정",
-                  "거래량배수": vol_mult, "지속일": f"최근 5일 중 {int(min_days)}일 이상",
+    is_accum = str(mode).lower().startswith("accum")
+    conditions = {"신호유형": "누적매집형(accum)" if is_accum else "급증형(spike)",
+                  "시가총액_억_이상": min_cap_억, "시가총액_기준": "신호일 가격으로 환산" if cap_mode == "scaled" else "최신 고정",
+                  "거래량": (f"최근 20일 평균 거래량이 이전 60일 평균의 {accum_mult}배 이상, 그 20일 안에 하루 {max_spike}배 이상 폭발한 날 없음"
+                           if is_accum else f"20일평균(최근5일 제외) 대비 {vol_mult}배 이상이 최근 5일 중 {int(min_days)}일 이상"),
+                  "저평가": val_note,
                   "20일등락률_pct": [ret_lo_pct, ret_hi_pct], "60일고점대비_pct": dd_max_pct,
                   "수급조건": flow_note,
                   "기준가변경보정": f"하루 ±{int(CA_THRESHOLD * 100)}% 초과 변동(액면분할 등) {n_ca}건 수정주가 방식으로 보정"}
     return {"ok": True, "dates": dates, "tickers": tickers, "panel_close": panel_close, "panel_vol": panel_vol,
             "ohlc": ohlc, "cap_panel": cap_panel, "sm": sm, "ok_mask": ok, "universe": universe, "entry": entry,
-            "sig_idx": sig_idx, "n_ca": n_ca, "flow_note": flow_note, "conditions": conditions}
+            "sig_idx": sig_idx, "n_ca": n_ca, "flow_note": flow_note, "conditions": conditions,
+            "per_panel": per_panel, "pbr_panel": pbr_panel, "mode": mode}
 
 
 def run_backtest(min_cap_억: float = 1000, vol_mult: float = 2.0, min_days: int = 3,
                  ret_lo_pct: float = -3.0, ret_hi_pct: float = 5.0, dd_max_pct: float = -10.0,
                  hold_days: int = 20, step: int = 1, require_flow: bool = False,
                  max_signals_listed: int = 40, lookback_days: int = 250,
-                 horizons: Any = None, cap_mode: str = "scaled", cooldown: int = 20) -> dict[str, Any]:
+                 horizons: Any = None, cap_mode: str = "scaled", cooldown: int = 20,
+                 mode: str = "spike", accum_mult: float = 1.5, max_spike: float = 5.0,
+                 per_max: float | None = None, pbr_max: float | None = None, flow_mode: str = "any") -> dict[str, Any]:
     """캐시된 거래일(lookback_days)을 대상으로 날짜별 신호 → 여러 보유기간(horizons) 뒤 수익률 집계."""
     t0 = time.time()
     hold_days = int(hold_days)
@@ -739,7 +827,8 @@ def run_backtest(min_cap_억: float = 1000, vol_mult: float = 2.0, min_days: int
     ctx = _signal_context(min_cap_억=min_cap_억, vol_mult=vol_mult, min_days=min_days, ret_lo_pct=ret_lo_pct,
                           ret_hi_pct=ret_hi_pct, dd_max_pct=dd_max_pct, lookback_days=lookback_days,
                           min_forward=max_h, step=step, require_flow=require_flow, cap_mode=cap_mode,
-                          cooldown=cooldown)
+                          cooldown=cooldown, mode=mode, accum_mult=accum_mult, max_spike=max_spike,
+                          per_max=per_max, pbr_max=pbr_max, flow_mode=flow_mode)
     if not ctx["ok"]:
         return ctx
     dates, tickers, panel_close = ctx["dates"], ctx["tickers"], ctx["panel_close"]
@@ -1038,7 +1127,9 @@ def run_exit_backtest(min_cap_억: float = 1000, vol_mult: float = 3.0, min_days
                       ret_lo_pct: float = -3.0, ret_hi_pct: float = 5.0, dd_max_pct: float = -10.0,
                       tp_pct: Any = "10", sl_pct: Any = "7", max_hold: Any = "10", exit_mode: str = "intraday",
                       cost_pct: float = 0.3, step: int = 1, require_flow: bool = False, lookback_days: int = 250,
-                      cap_mode: str = "scaled", max_trades_listed: int = 30) -> dict[str, Any]:
+                      cap_mode: str = "scaled", max_trades_listed: int = 30,
+                      mode: str = "spike", accum_mult: float = 1.5, max_spike: float = 5.0,
+                      per_max: float | None = None, pbr_max: float | None = None, flow_mode: str = "any") -> dict[str, Any]:
     """신호 조건은 run_backtest 와 같고, 청산을 익절/손절/최대보유 규칙으로 바꿔 거래 단위 성과를 집계."""
     t0 = time.time()
     tps = _parse_num_list(tp_pct, [10.0])
@@ -1047,12 +1138,13 @@ def run_exit_backtest(min_cap_억: float = 1000, vol_mult: float = 3.0, min_days
     combos = [(tp, sl, h) for h in holds for tp in tps for sl in sls]
     if len(combos) > 12:
         return {"ok": False, "error": f"조합이 {len(combos)}개입니다. tp×sl×max_hold 는 12개 이하로 주세요."}
-    mode = "close" if str(exit_mode).lower().startswith("c") else "intraday"
+    exit_m = "close" if str(exit_mode).lower().startswith("c") else "intraday"
     cost = float(cost_pct) / 100.0
     ctx = _signal_context(min_cap_억=min_cap_억, vol_mult=vol_mult, min_days=min_days, ret_lo_pct=ret_lo_pct,
                           ret_hi_pct=ret_hi_pct, dd_max_pct=dd_max_pct, lookback_days=lookback_days,
                           min_forward=max(holds), step=step, require_flow=require_flow, cap_mode=cap_mode,
-                          cooldown=20, need_ohlc=(mode == "intraday"))
+                          cooldown=20, need_ohlc=(exit_m == "intraday"), mode=mode, accum_mult=accum_mult,
+                          max_spike=max_spike, per_max=per_max, pbr_max=pbr_max, flow_mode=flow_mode)
     if not ctx["ok"]:
         return ctx
     dates, tickers = ctx["dates"], list(ctx["tickers"])
@@ -1066,7 +1158,7 @@ def run_exit_backtest(min_cap_억: float = 1000, vol_mult: float = 3.0, min_days
     results = []
     first_detail: dict[str, Any] | None = None
     for (tp, sl, h) in combos:
-        ret, day, why = exit_matrix(close, ohlc, tp=tp / 100.0, sl=sl / 100.0, max_hold=h, mode=mode, cost=cost)
+        ret, day, why = exit_matrix(close, ohlc, tp=tp / 100.0, sl=sl / 100.0, max_hold=h, mode=exit_m, cost=cost)
         rows, cols = _trade_select(ok, day, ret)
         tr = ret[rows, cols] if len(rows) else np.array([])
         td = day[rows, cols] if len(rows) else np.array([])
@@ -1122,7 +1214,7 @@ def run_exit_backtest(min_cap_억: float = 1000, vol_mult: float = 3.0, min_days
         "period": {"signal_from": dates[sig_idx[0]], "signal_to": dates[sig_idx[-1]], "signal_dates": len(sig_idx),
                    "data_from": dates[0], "data_to": dates[-1], "trading_days_used": len(dates)},
         "conditions": ctx["conditions"],
-        "exit_rules": {"mode": "장중 고가·저가 터치 기준(갭은 시가 체결, 같은 날 양쪽 터치는 손절 우선)" if mode == "intraday" else "종가 판정",
+        "exit_rules": {"mode": "장중 고가·저가 터치 기준(갭은 시가 체결, 같은 날 양쪽 터치는 손절 우선)" if exit_m == "intraday" else "종가 판정",
                        "cost_pct_round_trip": cost_pct, "combos": len(combos)},
         "signals_total": int(ok.sum()),
         "results": results,
@@ -1135,6 +1227,77 @@ def run_exit_backtest(min_cap_억: float = 1000, vol_mult: float = 3.0, min_days
         "elapsed_sec": round(time.time() - t0, 1),
         "note": "과거 통계이며 미래 수익을 보장하지 않습니다. 매매 권유가 아닙니다.",
     }
+
+
+# ────────────────────────────────────────────────────────────
+# 누적매집형 + 저평가 실시간 스크리너 (최근 거래일 기준)
+# ────────────────────────────────────────────────────────────
+def run_accum_screen(min_cap_억: float = 1000, accum_mult: float = 1.5, max_spike: float = 5.0,
+                     ret_lo_pct: float = -3.0, ret_hi_pct: float = 5.0, dd_max_pct: float = -10.0,
+                     per_max: float | None = 25.0, pbr_max: float | None = 1.5,
+                     require_flow: bool = True, flow_mode: str = "any", max_results: int = 30) -> dict[str, Any]:
+    t0 = time.time()
+    have = _cached_dates()
+    if len(have) < 90:
+        return {"ok": False, "error": f"거래일 데이터 부족 ({len(have)}일, 최소 90일 필요). screener_cache_status 확인 후 재실행.",
+                "prefetch": dict(_prefetch_state)}
+    dates = have[-max(90, min(len(have), 250)):]
+    # 최근 거래일 수급은 바로 받아서 캐시에 넣는다(4회 KRX 조회)
+    if require_flow:
+        key = (dates[-20], dates[-1])
+        if key not in _flow_cache:
+            f, ins, _ = _flows(*key)
+            _flow_cache[key] = (f, ins)
+    ctx = _signal_context(min_cap_억=min_cap_억, vol_mult=2.0, min_days=3, ret_lo_pct=ret_lo_pct,
+                          ret_hi_pct=ret_hi_pct, dd_max_pct=dd_max_pct, lookback_days=len(dates),
+                          min_forward=0, step=1, require_flow=False, cap_mode="latest",
+                          cooldown=1, mode="accum", accum_mult=accum_mult, max_spike=max_spike,
+                          per_max=per_max, pbr_max=pbr_max, flow_mode=flow_mode)
+    if not ctx["ok"]:
+        return ctx
+    sm, ok, tickers = ctx["sm"], ctx["ok_mask"], list(ctx["tickers"])
+    last = ctx["dates"][-1]
+    row_ok = ok.iloc[-1].copy()
+    key = (ctx["dates"][-20], last)
+    f_ser, i_ser = _flow_cache.get(key, (pd.Series(dtype="float64"), pd.Series(dtype="float64")))
+    if require_flow and not (f_ser.empty and i_ser.empty):
+        fl = f_ser.reindex(tickers).fillna(0.0); il = i_ser.reindex(tickers).fillna(0.0)
+        cond = ((fl > 0) & (il > 0)) if str(flow_mode).lower() == "both" else ((fl > 0) | (il > 0))
+        row_ok = row_ok & cond.values
+        ctx["conditions"]["수급조건"] = ("적용(외국인 그리고 기관 20일 순매수 > 0)" if str(flow_mode).lower() == "both"
+                                     else "적용(외국인 또는 기관 20일 순매수 > 0)")
+    elif require_flow:
+        ctx["conditions"]["수급조건"] = "미적용(수급 데이터 없음 — KRX_ID/KRX_PW 확인)"
+    names = _name_map(last)
+    cap_panel = ctx["cap_panel"]
+    per_p, pbr_p = ctx["per_panel"], ctx["pbr_panel"]
+    rows = []
+    for t in tickers:
+        if not bool(row_ok.get(t, False)):
+            continue
+        def _v(panel):
+            if panel is None: return None
+            x = panel[t].iloc[-1]
+            return None if pd.isna(x) else float(x)
+        rows.append({
+            "code": t, "name": names.get(t, t),
+            "close": int(round(float(ctx["panel_close"][t].iloc[-1]))),
+            "cap_억": round(_v(cap_panel) / 1e8) if _v(cap_panel) else None,
+            "accum_ratio_20v60": round(float(sm["accum_ratio"][t].iloc[-1]), 2),
+            "max_daily_spike_20d": round(float(sm["max_spike_ratio"][t].iloc[-1]), 1),
+            "ret20_pct": round(float(sm["ret"][t].iloc[-1]) * 100, 1),
+            "dd60_pct": round(float(sm["dd"][t].iloc[-1]) * 100, 1),
+            "PER": round(_v(per_p), 1) if _v(per_p) is not None else None,
+            "PBR": round(_v(pbr_p), 2) if _v(pbr_p) is not None else None,
+            "foreign20_억": round(float(f_ser.get(t, 0.0)) / 1e8, 1),
+            "inst20_억": round(float(i_ser.get(t, 0.0)) / 1e8, 1),
+        })
+    rows.sort(key=lambda r: -r["accum_ratio_20v60"])
+    return {"ok": True, "as_of": f"{last[:4]}-{last[4:6]}-{last[6:]}", "conditions": ctx["conditions"],
+            "passed_count": len(rows), "passed": rows[:max_results],
+            "elapsed_sec": round(time.time() - t0, 1),
+            "note": "사실 데이터 집계이며 매매 권유가 아닙니다. 거래량 증가 원인(공시·뉴스)을 확인하세요.",
+            "source": "KRX via pykrx"}
 
 
 def prefetch(days: int | None = None) -> None:
