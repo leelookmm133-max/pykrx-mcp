@@ -15,6 +15,17 @@ server.py 가 import 해서 MCP 도구로 노출합니다.
 서버 시작 시 백그라운드로 PREFETCH_DAYS(기본 250거래일 ≈ 1년)를 미리 받아 두므로(prefetch)
 스크리너는 보통 바로 응답하고, 백테스트(run_backtest)는 1년치 신호를 한 번에 집계합니다.
 캐시가 아직 부족하면 백테스트는 기다리지 않고 status="preparing" 을 돌려줍니다.
+
+메모리 주의 (2026-11-07 수정)
+  캐시 한 날짜의 실제 데이터는 약 0.1MB 인데, 예전에는 하루마다 약 1.9MB 씩 늘어나 500일을 받으면
+  Railway 메모리 한도(1GB)를 넘겨 서버가 죽었습니다(실측: 426일째 956MB 에서 OOM 재시작).
+  원인은 KRX 응답(JSON)을 파싱할 때 생기는 수만 개의 임시 문자열 사이에 종목코드 문자열(인덱스)이
+  섞여 살아남아, 파이썬이 그 메모리 풀 전체를 해제하지 못하는 것이었습니다.
+  지금은 (1) 종목코드를 전역 테이블(_intern)로 한 번만 만들어 공유하고, (2) 파싱 쓰레기가 해제된 뒤
+  새로 만든 객체만 캐시에 넣으며(_compact_copy), (3) 날짜마다 malloc_trim 으로 힙 조각을 반환합니다.
+  수급(_flow_cache)·PER/PBR(_fund_cache) 캐시에도 같은 처리를 했습니다.
+  실측(합성 데이터, 같은 파싱 경로): 하루 1.7MB → 0.13MB, 500일 ≈ 65MB. 수급은 날짜당 0.47MB → 0.19MB.
+  screener_cache_status 의 process_rss_mb 로 서버 메모리를 바로 볼 수 있습니다.
 """
 from __future__ import annotations
 
@@ -47,6 +58,58 @@ _flow_cache: dict[tuple[str, str], tuple[pd.Series, pd.Series]] = {}   # (start,
 _flow_job: dict[str, Any] = {"running": False, "done": 0, "target": 0, "last_error": None}
 _index_cache: dict[tuple[str, str, str], pd.Series | None] = {}
 _kosdaq_cache: tuple[str, set[str]] | None = None
+
+# 종목코드 문자열 공유 테이블. KRX 응답을 파싱할 때 만들어진 문자열을 캐시에 그대로 두면, 같은 메모리 풀에
+# 있던 임시 문자열(수만 개)이 모두 해제돼도 풀이 반환되지 못해 하루 약 1.9MB 씩 샜습니다(250일 ≈ 480MB).
+# 캐시에 들어가는 종목코드는 전부 이 테이블의 객체 하나로 통일합니다.
+_intern_tab: dict[str, str] = {}
+
+
+def _intern(s: Any) -> str:
+    s = str(s)
+    return _intern_tab.setdefault(s, s)
+
+
+def _compact_copy(df: pd.DataFrame) -> pd.DataFrame:
+    """값은 같고 객체는 전부 새로 만든 DataFrame(인덱스는 공유 문자열)."""
+    data = {c: np.ascontiguousarray(df[c].to_numpy()) for c in df.columns}
+    idx = pd.Index([_intern(t) for t in df.index], dtype=object, name=df.index.name)
+    return pd.DataFrame(data, index=idx)
+
+
+# glibc 의 malloc_trim: 해제됐지만 프로세스가 쥐고 있는 힙 조각을 OS 에 돌려줍니다(없으면 조용히 건너뜀).
+# 하루치 응답을 파싱할 때 생기는 수 MB 의 임시 메모리가 캐시 사이사이에 조각으로 남는 것을 막아 줍니다.
+_libc = None
+try:
+    import ctypes
+    import ctypes.util
+    try:
+        _libc = ctypes.CDLL("libc.so.6")
+    except OSError:
+        _name = ctypes.util.find_library("c")
+        _libc = ctypes.CDLL(_name) if _name else None
+    if _libc is not None and not hasattr(_libc, "malloc_trim"):
+        _libc = None
+except Exception:  # noqa: BLE001
+    _libc = None
+
+
+def _malloc_trim() -> None:
+    if _libc is not None:
+        try:
+            _libc.malloc_trim(0)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _rss_mb() -> float | None:
+    """현재 프로세스 상주 메모리(MB). Linux 외에서는 None."""
+    try:
+        with open("/proc/self/statm") as f:
+            return round(int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1e6, 1)
+    except Exception:  # noqa: BLE001
+        return None
+
 
 # 서버 시작 시 미리 받아둘 거래일 수. 백테스트 1년치(신호 약 170거래일)를 바로 돌리려면 250 이상.
 PREFETCH_DAYS = int(os.environ.get("SCREENER_PREFETCH_DAYS", "250"))
@@ -128,9 +191,11 @@ def _ensure_days(n_days: int, max_calendar_back: int | None = None) -> list[str]
             if df.empty:
                 _holidays.add(ymd)
                 continue
+            df = _compact_copy(df)      # 응답 파싱 쓰레기가 해제된 뒤 새로 만든 객체만 캐시에 남긴다
             with _lock:
                 _ohlcv_by_date[ymd] = df
             cached = df
+            _malloc_trim()
         dates.append(ymd)
     dates.sort()
     return dates
@@ -209,9 +274,10 @@ def _flows(start: str, end: str) -> tuple[pd.Series, pd.Series, dict[str, str]]:
                 continue
             col = "순매수거래대금" if "순매수거래대금" in df.columns else df.columns[-1]
             for t, row in df.iterrows():
-                bucket[str(t)] = float(row[col])
+                t = _intern(t)          # 수급 캐시(_flow_cache)에 오래 남는 키이므로 공유 문자열로
+                bucket[t] = float(row[col])
                 if "종목명" in df.columns:
-                    names[str(t)] = str(row["종목명"])
+                    names[t] = str(row["종목명"])
     return pd.Series(foreign, dtype="float64"), pd.Series(inst, dtype="float64"), names
 
 
@@ -557,8 +623,9 @@ def _fundamental_one_day(ymd: str) -> pd.DataFrame:
         df = pd.DataFrame()
     keep = [c for c in ("PER", "PBR", "EPS", "BPS", "DIV") if c in df.columns]
     df = df[keep].copy() if keep else pd.DataFrame()
-    df.index = [str(i) for i in df.index]
+    df.index = [_intern(i) for i in df.index]       # 캐시에 남는 인덱스는 공유 문자열로
     _fund_cache[ymd] = df
+    _malloc_trim()
     return df
 
 
@@ -661,6 +728,7 @@ def _flows_for_dates(dates: list[str], idx_list: list[int]) -> None:
                 if key not in _flow_cache:
                     f, ins, _ = _flows(*key)
                     _flow_cache[key] = (f, ins)
+                    _malloc_trim()
                     if FETCH_DELAY > 0:
                         time.sleep(FETCH_DELAY)
                 _flow_job["done"] = n + 1
@@ -1326,7 +1394,9 @@ def cache_status() -> dict[str, Any]:
         latest = max(_ohlcv_by_date) if _ohlcv_by_date else None
         earliest = min(_ohlcv_by_date) if _ohlcv_by_date else None
     return {"cached_days": n, "earliest": earliest, "latest": latest, "prefetch": dict(_prefetch_state),
-            "flow_job": dict(_flow_job), "flow_cached_dates": len(_flow_cache)}
+            "flow_job": dict(_flow_job), "flow_cached_dates": len(_flow_cache),
+            "fundamental_cached_dates": len(_fund_cache), "tickers_known": len(_intern_tab),
+            "process_rss_mb": _rss_mb()}
 
 
 if os.environ.get("SCREENER_PREFETCH", "1") != "0":
