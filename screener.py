@@ -141,6 +141,35 @@ def _cached_dates() -> list[str]:
         return sorted(_ohlcv_by_date)
 
 
+# 국내 주식 일일 가격제한폭은 ±30% 이므로, 하루 종가 변동이 이를 넘으면 액면분할·병합·감자 같은
+# 기준가 변경(수정 없는 원시 데이터의 흔적)으로 봅니다. 예: 2026-04 대한제분 10:1 분할이 -92% 로 찍힘.
+CA_THRESHOLD = float(os.environ.get("SCREENER_CA_THRESHOLD", "0.31"))
+
+
+def adjust_corporate_actions(panel_close: pd.DataFrame, panel_vol: pd.DataFrame | None = None,
+                             threshold: float = CA_THRESHOLD) -> tuple[pd.DataFrame, pd.DataFrame | None, int]:
+    """기준가 변경일 이전 구간을 사후 기준으로 환산(수정주가와 같은 효과).
+
+    변동 > threshold 인 날의 비율 f = 종가/전일종가 를 분할 비율로 보고, 그 이전 모든 날의
+    종가에 f 를 곱하고 거래량은 f 로 나눕니다(10:1 분할이면 이전 가격 ×0.1, 거래량 ×10).
+    반환: (조정 종가, 조정 거래량, 조정 이벤트 수). 행=날짜 오름차순, 열=티커.
+    """
+    c = panel_close.astype(float)
+    c = c.where(c > 0)                      # 0(거래정지 등)은 결측으로
+    prev = c.shift(1)
+    ratio = c / prev
+    events = c.notna() & prev.notna() & ((ratio - 1.0).abs() > threshold)
+    n_events = int(events.values.sum())
+    if n_events == 0:
+        return c, (panel_vol.astype(float) if panel_vol is not None else None), 0
+    f = ratio.where(events, 1.0).fillna(1.0)
+    # 각 날짜에 대해 "그 이후에 일어난 이벤트 비율의 곱" = 뒤에서부터 누적곱 후 한 칸 앞당김
+    cum_after = f.iloc[::-1].cumprod().iloc[::-1].shift(-1).fillna(1.0)
+    c_adj = c * cum_after
+    v_adj = (panel_vol.astype(float) / cum_after) if panel_vol is not None else None
+    return c_adj, v_adj, n_events
+
+
 def _market_caps(ymd: str) -> pd.DataFrame:
     global _cap_cache
     if _cap_cache and _cap_cache[0] == ymd:
@@ -302,6 +331,7 @@ def run_screen(min_cap_억: float = 1000, vol_mult: float = 2.0, min_days: int =
         frames = {d: _ohlcv_by_date[d] for d in dates}
     panel_close = pd.DataFrame({d: f["종가"] for d, f in frames.items()}).T.sort_index()
     panel_vol = pd.DataFrame({d: f["거래량"] for d, f in frames.items()}).T.sort_index()
+    panel_close, panel_vol, n_ca = adjust_corporate_actions(panel_close, panel_vol)   # 액면분할 등 보정
 
     last = dates[-1]
     caps_df = _market_caps(last)
@@ -334,6 +364,7 @@ def run_screen(min_cap_억: float = 1000, vol_mult: float = 2.0, min_days: int =
             "20일등락률_pct": [ret_lo_pct, ret_hi_pct],
             "60일고점대비_pct_이내": dd_max_pct,
             "수급": "외국인 또는 기관 20일 누적 순매수 > 0" if (require_flow and flow_ok) else "미적용",
+            "기준가변경보정": f"하루 ±{int(CA_THRESHOLD * 100)}% 초과 변동(액면분할 등) {n_ca}건 수정주가 방식으로 보정",
         },
         "passed_count": len(passed),
         "passed": passed[:max_results],
@@ -394,6 +425,7 @@ def run_momentum(min_cap_억: float = 1000, min_score: int = 4, max_results: int
     with _lock:
         frames = {d: _ohlcv_by_date[d] for d in dates}
     panel_close = pd.DataFrame({d: f["종가"] for d, f in frames.items()}).T.sort_index()
+    panel_close, _unused, _n_ca = adjust_corporate_actions(panel_close, None)   # 액면분할 등 보정(거래대금은 불변)
     panel_val = (pd.DataFrame({d: f["거래대금"] for d, f in frames.items() if "거래대금" in f.columns}).T.sort_index()
                  if all("거래대금" in f.columns for f in frames.values()) else None)
     last = dates[-1]
@@ -619,8 +651,8 @@ def run_backtest(min_cap_억: float = 1000, vol_mult: float = 2.0, min_days: int
     panel_vol.columns = [str(c) for c in panel_vol.columns]
     panel_close = panel_close.astype(float)
     panel_vol = panel_vol.astype(float)
-    # 거래정지 등으로 종가 0 이 들어오면 결측 처리
-    panel_close = panel_close.where(panel_close > 0)
+    # 거래정지 등으로 종가 0 이 들어오면 결측 처리 + 액면분할·병합 등 기준가 변경을 수정주가 방식으로 보정
+    panel_close, panel_vol, n_ca = adjust_corporate_actions(panel_close, panel_vol)
     tickers = panel_close.columns
 
     # 2) 시가총액: 최신 시총을 가격 비율로 환산(scaled) 또는 최신값 고정(latest)
@@ -720,10 +752,16 @@ def run_backtest(min_cap_억: float = 1000, vol_mult: float = 2.0, min_days: int
         mn_all = _pick(mn, sel)
         uni = fwd.where(universe & fwd.notna())
         uni_by_date = uni.mean(axis=1)                      # 날짜별 유니버스 평균
-        sig_dates = sel.any(axis=1)
-        uni_avg = float(uni_by_date[sig_dates].mean()) if bool(sig_dates.any()) else None
-        if uni_avg is not None and pd.isna(uni_avg):
-            uni_avg = None
+
+        def _uni_weighted(mask: pd.DataFrame):
+            """신호 수로 가중한 유니버스 평균 — 신호 평균과 같은 날짜 구성으로 비교."""
+            w = mask.sum(axis=1).astype(float)
+            okw = w.gt(0) & uni_by_date.notna()
+            if not bool(okw.any()):
+                return None
+            return float((uni_by_date[okw] * w[okw]).sum() / w[okw].sum())
+
+        uni_avg = _uni_weighted(sel)
         st = _stats(f_all)
         st.update({
             "avg_excess_vs_index_pct": round(float(ex_all.mean()) * 100, 2) if len(ex_all) else None,
@@ -740,8 +778,10 @@ def run_backtest(min_cap_억: float = 1000, vol_mult: float = 2.0, min_days: int
         est = _stats(f_ent)
         if est["n"]:
             ex_ent = _pick(excess, esel)
+            uni_ent = _uni_weighted(esel)
             est["avg_excess_vs_index_pct"] = round(float(ex_ent.mean()) * 100, 2) if len(ex_ent) else None
-            est["avg_vs_universe_pct"] = round((float(f_ent.mean()) - uni_avg) * 100, 2) if uni_avg is not None else None
+            est["universe_avg_pct"] = round(uni_ent * 100, 2) if uni_ent is not None else None
+            est["avg_vs_universe_pct"] = round((float(f_ent.mean()) - uni_ent) * 100, 2) if uni_ent is not None else None
             est["share_ge_10pct"] = round(float((f_ent >= 0.10).mean()) * 100, 1)
         entries_results[f"{h}d"] = est
         if h == hold_days:
@@ -759,10 +799,11 @@ def run_backtest(min_cap_억: float = 1000, vol_mult: float = 2.0, min_days: int
         "conditions": {"시가총액_억_이상": min_cap_억, "시가총액_기준": "신호일 가격으로 환산" if cap_mode == "scaled" else "최신 고정",
                        "거래량배수": vol_mult, "지속일": f"최근 5일 중 {int(min_days)}일 이상",
                        "20일등락률_pct": [ret_lo_pct, ret_hi_pct], "60일고점대비_pct": dd_max_pct,
-                       "수급조건": flow_note},
+                       "수급조건": flow_note,
+                       "기준가변경보정": f"하루 ±{int(CA_THRESHOLD * 100)}% 초과 변동(액면분할 등) {n_ca}건 수정주가 방식으로 보정"},
         "signals_total": n_signals, "entries_first_signal_only": n_entries, "cooldown_days": int(cooldown),
         "benchmark": {"index": "종목 시장별 KOSPI(1001)/KOSDAQ(2001)" if (kospi_idx is not None) else "없음",
-                      "universe": "같은 날 시총 조건을 만족한 전종목 평균(아무 종목이나 골랐을 때)"},
+                      "universe": "같은 날 시총 조건을 만족한 전종목 평균을 신호 수로 가중(아무 종목이나 골랐을 때)"},
         "summary_by_horizon": results,
         "entries_by_horizon": entries_results,
     }
@@ -831,6 +872,7 @@ def run_backtest(min_cap_억: float = 1000, vol_mult: float = 2.0, min_days: int
         "best5": best, "worst5": worst,
         "signals_latest": listed,
         "caveats": ["시가총액은 최신 시총을 신호일 가격으로 환산(상장주식수 변동 미반영)",
+                    "하루 ±31% 초과 변동은 기준가 변경(액면분할 등)으로 보고 보정 — 그날의 실제 등락은 0으로 간주",
                     "생존편향: 최신 시총 목록에 없는(상장폐지 등) 종목은 제외",
                     "신호일 종가 매수·보유기간 종가 매도 가정, 거래비용·호가 미반영",
                     "같은 종목의 연속 신호는 중복 표본 → entries_* 집계를 함께 볼 것",
