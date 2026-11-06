@@ -585,6 +585,32 @@ def backtest_volume_breakout(min_cap_eok: float = 1000, vol_mult: float = 2.0, m
 
 
 @mcp.tool()
+def backtest_exit_rules(min_cap_eok: float = 1000, vol_mult: float = 3.0, min_days: int = 3,
+                        ret_lo_pct: float = -3.0, ret_hi_pct: float = 5.0, dd_max_pct: float = -10.0,
+                        tp_pct: str = "10", sl_pct: str = "7", max_hold: str = "10", exit_mode: str = "intraday",
+                        cost_pct: float = 0.3, lookback_days: int = 250, step: int = 1, require_flow: bool = False,
+                        cap_mode: str = "scaled", max_trades_listed: int = 30) -> dict[str, Any]:
+    """
+    거래량 급증·주가 미반영 신호(backtest_volume_breakout 과 같은 조건)에 익절·손절·최대보유 청산 규칙을 적용한
+    거래 단위 백테스트. 신호일 종가 진입 → 다음 날부터 익절선(tp_pct) 또는 손절선(sl_pct)에 닿으면 청산,
+    max_hold 거래일째면 종가 청산. 왕복 거래비용 cost_pct(기본 0.3%)를 뺀 순수익률로 집계합니다.
+
+    tp_pct / sl_pct / max_hold 는 "10,15" 처럼 쉼표로 여러 값을 주면 조합(최대 12개)을 한 번에 비교합니다. 0 은 해당 규칙 미사용.
+    exit_mode="intraday"(기본) 는 장중 고가·저가 터치로 판정(갭은 시가 체결, 같은 날 양쪽 터치는 손절 우선), "close" 는 종가로만 판정.
+    결과: trades(같은 종목은 청산 후에만 재진입하는 비중복 거래), signals_all(신호마다 독립 진입),
+    universe_same_rule(시총 조건 통과 전종목에 같은 규칙 적용 = 아무 종목이나 골랐을 때), plain_hold_same_entries(규칙 없이 max_hold 보유).
+    캐시가 부족하면 status="preparing" 이 먼저 올 수 있습니다(screener_cache_status 로 확인 후 재호출).
+    결과는 과거 통계이며 매매 권유가 아닙니다.
+    """
+    return screener.run_exit_backtest(min_cap_억=min_cap_eok, vol_mult=vol_mult, min_days=int(min_days),
+                                      ret_lo_pct=ret_lo_pct, ret_hi_pct=ret_hi_pct, dd_max_pct=dd_max_pct,
+                                      tp_pct=tp_pct, sl_pct=sl_pct, max_hold=max_hold, exit_mode=exit_mode,
+                                      cost_pct=cost_pct, step=int(step), require_flow=require_flow,
+                                      lookback_days=int(lookback_days), cap_mode=cap_mode,
+                                      max_trades_listed=int(max_trades_listed))
+
+
+@mcp.tool()
 def screener_prefetch(days: int = 250) -> dict[str, Any]:
     """전종목 일별 데이터를 days 거래일만큼 백그라운드로 미리 받아 둡니다(백테스트 기간 확장용, 최대 500).
     바로 돌아오며, 진행률은 screener_cache_status 로 확인합니다."""
