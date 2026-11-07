@@ -32,6 +32,7 @@ from pykrx import stock
 
 import indicators          # 같은 폴더. 지표 계산을 서버에서 수행
 import screener            # 같은 폴더. 전종목 조건 스크리너
+import factors             # 같은 폴더. 학계식 팩터(횡단면 순위) 백테스트·스크리너 (월말 스냅샷 캐시)
 
 # MCP SDK 2.x 에서 FastMCP 가 MCPServer 로 이름이 바뀌었습니다.
 # 어느 버전이 깔려도 돌아가게 둘 다 시도합니다.
@@ -734,6 +735,61 @@ def screener_prefetch(days: int = 250) -> dict[str, Any]:
 def screener_cache_status() -> dict[str, Any]:
     """스크리너 캐시 상태(받아둔 거래일 수·기간, 백그라운드 준비 진행률, 수급 캐시)를 확인합니다."""
     return screener.cache_status()
+
+
+# ─────────────────────────────────────────────────────────────
+# 팩터(횡단면 순위) 백테스트·스크리너 — 학계·실전 퀀트 방식
+#   매월 말 유니버스 전종목을 팩터 백분위 순위로 점수화 → 상위 포트폴리오 → 다음 달 수익률.
+#   10년 월간 리밸런싱, 10분위, IC, t-통계량. 자세한 설명은 factors.py 머리말.
+# ─────────────────────────────────────────────────────────────
+@mcp.tool()
+def factor_prefetch(years: float = 10) -> dict[str, Any]:
+    """팩터 백테스트용 월말 스냅샷(전종목 시세·수정주가 월간수익률·PER/PBR)을 years 년 + 13개월만큼 백그라운드로 받아 둡니다.
+    월말당 KRX 3회(약 5~7초) → 10년이면 약 15분. 바로 돌아오며 진행률은 factor_cache_status 로 확인합니다.
+    서버 시작 시 자동으로 10년치를 받기 시작하므로 보통은 호출할 필요가 없습니다(기간을 늘릴 때만)."""
+    years = max(2.0, min(float(years), 20.0))
+    return factors.prefetch(years)
+
+
+@mcp.tool()
+def factor_cache_status() -> dict[str, Any]:
+    """팩터 캐시 상태: 받아둔 월말 수·기간, 진행률, 월간 수익률 출처(KRX 수정주가 / 종가 폴백)와 기준가 일치율, 메모리."""
+    return factors.cache_status()
+
+
+@mcp.tool()
+def backtest_factors(factors_spec: str = "value,quality,lowvol,mom", min_cap_eok: float = 1000, years: float = 10,
+                     top_pct: float = 10, top_n: int = 0, hold_months: int = 1, exclude_managed: bool = True,
+                     min_price: float = 1000, include_single_factor_table: bool = True,
+                     max_months_listed: int = 130) -> dict[str, Any]:
+    """학계식 팩터 백테스트: 매월 말 유니버스(보통주, 시총 min_cap_eok억↑) 전종목을 팩터 백분위 순위로 점수화해
+    상위 top_pct%(또는 top_n 종목)를 동일가중 매수, hold_months 개월 보유(월말 리밸런싱), 다음 달 수익률을
+    유니버스 동일가중 평균·종목별 시장 지수와 비교합니다. years 년(기본 10년 = 120개월).
+
+    factors_spec: 쉼표로 묶은 팩터 이름. 그룹 value(=bm+ep+dy 순위 평균), quality(=roe) 또는 개별
+      bm(1/PBR) ep(EPS/P) dy(배당수익률) roe(EPS/BPS) mom(12-1개월 모멘텀) rev(1개월 반전: 낮을수록 좋음)
+      lowvol(12개월 저변동성) high52(52주고가 근접) size(소형주) lowturn(저회전율). 복합점수 = 팩터 순위 평균.
+
+    결과: criteria_academic(사전 기준 5개 통과/미달: 월평균 초과 +0.3%p↑, t≥2, 월 적중률 55%↑, 전·후반 모두 플러스,
+    10분위 단조성), portfolio(월평균·초과·t·적중률·CAGR·MDD, 지수 대비), ic(순위상관), deciles(10분위),
+    top30_fixed(상위 30종목 고정 버전), by_year, monthly, single_factors(팩터별 단독 성과표 — 어떤 팩터가 한국에서
+    먹히는지), data_quality. 캐시가 아직 없으면 status="preparing" 과 진행률을 돌려줍니다.
+    결과는 과거 통계이며 매매 권유가 아닙니다."""
+    return factors.run_backtest(factors=factors_spec, min_cap_억=min_cap_eok, years=float(years), top_pct=float(top_pct),
+                                top_n=int(top_n), hold_months=int(hold_months), exclude_managed=bool(exclude_managed),
+                                min_price=float(min_price), include_single_factor_table=bool(include_single_factor_table),
+                                max_months_listed=int(max_months_listed))
+
+
+@mcp.tool()
+def screen_factors(factors_spec: str = "value,quality,lowvol,mom", min_cap_eok: float = 1000, top_n: int = 30,
+                   exclude_managed: bool = True, min_price: float = 1000) -> dict[str, Any]:
+    """최근 거래일 기준 팩터 복합점수 상위 종목(backtest_factors 와 같은 정의·유니버스). 종목별로 복합점수 백분위,
+    팩터별 순위, PBR·PER·배당·ROE·12-1모멘텀·1개월수익률·12개월변동성·52주고가·회전율을 함께 돌려줍니다.
+    최근 거래일 시세를 KRX 에서 3회 받아 하루 캐시합니다(약 5~10초). 월말 캐시 13개가 없으면 status="preparing".
+    사실 데이터 집계이며 매매 권유가 아닙니다 — 백테스트에서 기준을 통과한 조합만 쓰세요."""
+    return factors.run_screen(factors=factors_spec, min_cap_억=min_cap_eok, top_n=int(top_n),
+                              exclude_managed=bool(exclude_managed), min_price=float(min_price))
 
 
 @mcp.tool()

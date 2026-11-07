@@ -96,6 +96,31 @@ curl https://<이름>.up.railway.app/healthz
 
 ---
 
+---
+
+## 팩터(횡단면 순위) 백테스트·스크리너 — `factors.py` (2026-11-07 추가)
+
+학계·실전 퀀트가 쓰는 방식으로 종목 선별 기준을 검증합니다. 기존 `screener.py`(일별 캐시·절대 조건 신호)와 별도 캐시를 씁니다.
+
+| 도구 | 설명 |
+|---|---|
+| `factor_prefetch(years=10)` | 월말 스냅샷(전종목 시세·수정주가 월간수익률·PER/PBR)을 years년+13개월 백그라운드 수집. 서버 시작 시 자동 실행 |
+| `factor_cache_status()` | 수집 진행률, 월간 수익률 출처(KRX 수정주가 / 종가 폴백), 기준가 일치율, 메모리 |
+| `backtest_factors(factors_spec, min_cap_eok, years, top_pct, top_n, hold_months, …)` | 매월 말 유니버스 전종목을 팩터 백분위 순위로 점수화 → 상위 포트폴리오(동일가중) → 다음 달 수익률을 유니버스·지수와 비교. 10분위·IC·t-통계량·연도별·팩터별 단독 성과표 |
+| `screen_factors(factors_spec, min_cap_eok, top_n)` | 최근 거래일 기준 복합점수 상위 종목과 팩터 값 |
+
+팩터: `value`(=`bm` 1/PBR + `ep` EPS/P + `dy` 배당수익률 순위 평균), `quality`(=`roe` EPS/BPS), `mom`(12-1개월 모멘텀),
+`rev`(1개월 반전·낮을수록 좋음), `lowvol`(12개월 저변동성), `high52`(52주고가 근접), `size`(소형주), `lowturn`(저회전율).
+기본 복합: `value,quality,lowvol,mom`.
+
+평가 기준(결과 `criteria_academic` 에 통과/미달): ① 상위 포트 월평균 초과수익(유니버스 대비) +0.3%p↑ ② t≥2
+③ 월 적중률 55%↑ ④ 전·후반 모두 플러스 ⑤ 10분위 단조성(ρ≥0.7, D10>D1). 참고: IC 평균 ≥ 0.02.
+
+데이터: 월말마다 KRX 3회 호출(전종목시세 → 종목명·시장·시총·주식수·소속부 / 전종목등락률(수정주가) → 월간 수익률·거래대금 /
+PER·PBR·EPS·BPS·DIV). 10년 ≈ 133개 월말 ≈ 400회 ≈ 15분, 메모리 약 50MB. 일별 prefetch 가 끝난 뒤 시작합니다.
+
+환경 변수: `FACTOR_YEARS`(기본 10), `FACTOR_PREFETCH=0` 이면 자동 수집 끔.
+
 ## 알아둘 것
 
 ### KRX 계정 (`KRX_ID` / `KRX_PW`)
