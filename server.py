@@ -753,8 +753,15 @@ def factor_prefetch(years: float = 10) -> dict[str, Any]:
 
 @mcp.tool()
 def factor_cache_status() -> dict[str, Any]:
-    """팩터 캐시 상태: 받아둔 월말 수·기간, 진행률, 월간 수익률 출처(KRX 수정주가 / 종가 폴백)와 기준가 일치율, 메모리."""
+    """팩터 캐시 상태: 받아둔 월말 수·기간, 진행률, 월간 수익률 출처(KRX 수정주가 / 하이브리드 / 종가 폴백)와 기준가 일치율, 메모리."""
     return factors.cache_status()
+
+
+@mcp.tool()
+def factor_month_debug(ymd: str = "", n: int = 20) -> dict[str, Any]:
+    """팩터 캐시 월별 데이터 품질 진단. ymd 를 비우면 모든 월말의 [수익률 출처, 기준가 일치율, KRX 사용비율, 등락률 시작일, 상장수] 표.
+    ymd(예: 20240531)를 주면 그 달의 전종목등락률을 다시 받아 기준가가 직전 월말 종가와 다른 종목 n 개(이름·기준가·주식수 변동·수익률)를 보여줍니다."""
+    return factors.month_debug(ymd=str(ymd or ""), n=int(n))
 
 
 @mcp.tool()

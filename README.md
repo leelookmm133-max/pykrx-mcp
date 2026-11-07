@@ -105,7 +105,8 @@ curl https://<이름>.up.railway.app/healthz
 | 도구 | 설명 |
 |---|---|
 | `factor_prefetch(years=10)` | 월말 스냅샷(전종목 시세·수정주가 월간수익률·PER/PBR)을 years년+13개월 백그라운드 수집. 서버 시작 시 자동 실행 |
-| `factor_cache_status()` | 수집 진행률, 월간 수익률 출처(KRX 수정주가 / 종가 폴백), 기준가 일치율, 메모리 |
+| `factor_cache_status()` | 수집 진행률, 월간 수익률 출처(KRX 수정주가 / 하이브리드 / 종가 폴백), 기준가 일치율, 메모리 |
+| `factor_month_debug(ymd="", n=20)` | 월별 데이터 품질 표; ymd 를 주면 그 달 기준가가 직전 월말 종가와 다른 종목 샘플 |
 | `backtest_factors(factors_spec, min_cap_eok, years, top_pct, top_n, hold_months, …)` | 매월 말 유니버스 전종목을 팩터 백분위 순위로 점수화 → 상위 포트폴리오(동일가중) → 다음 달 수익률을 유니버스·지수와 비교. 10분위·IC·t-통계량·연도별·팩터별 단독 성과표 |
 | `screen_factors(factors_spec, min_cap_eok, top_n)` | 최근 거래일 기준 복합점수 상위 종목과 팩터 값 |
 
@@ -117,7 +118,7 @@ curl https://<이름>.up.railway.app/healthz
 ③ 월 적중률 55%↑ ④ 전·후반 모두 플러스 ⑤ 10분위 단조성(ρ≥0.7, D10>D1). 참고: IC 평균 ≥ 0.02.
 
 데이터: 월말마다 KRX 3회 호출(전종목시세 → 종목명·시장·시총·주식수·소속부 / 전종목등락률(수정주가) → 월간 수익률·거래대금 /
-PER·PBR·EPS·BPS·DIV). 10년 ≈ 133개 월말 ≈ 400회 ≈ 15분, 메모리 약 50MB. 일별 prefetch 가 끝난 뒤 시작합니다.
+PER·PBR·EPS·BPS·DIV) + KOSPI 지수 일별(거래일 달력, 연 1회). 10년 ≈ 133개 월말 ≈ 410회 ≈ 8~15분, 메모리 약 50MB. 일별 prefetch 가 끝난 뒤 시작합니다.
 
 환경 변수: `FACTOR_YEARS`(기본 10), `FACTOR_PREFETCH=0` 이면 자동 수집 끔.
 

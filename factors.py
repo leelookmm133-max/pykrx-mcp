@@ -15,9 +15,12 @@ server.py 가 import 해서 MCP 도구(factor_prefetch, factor_cache_status, bac
 데이터 (월말마다 KRX 3회 호출, 10년+준비기간 13개월 ≈ 133개 월말 ≈ 400회, 약 15분)
   1. 전종목시세(MDCSTAT01501, ALL): 종목명·시장·종가·시가총액·상장주식수·소속부   → 유니버스·시총·우선주/스팩/관리 판별
   2. 전종목등락률(MDCSTAT01602, ALL, 수정주가): 직전 월말→이번 월말 수정주가 수익률, 월간 거래량·거래대금
-     → 액면분할·무상증자 등이 보정된 월간 수익률. 시작일 기준가가 직전 월말 종가와 맞는지 자동 검증(90% 이상 일치해야
-       인정)하고, 어긋나면 종가 기반(상장주식수 변동 보정)으로 대체합니다. 시작일 해석(직전월말 당일/다음날)은 첫 달에 자동 판별.
+     → 액면분할·무상증자 등이 보정된 월간 수익률. 시작일은 '직전 월말의 다음 거래일'(KOSPI 지수 일별 데이터로 만든
+       거래일 달력 사용; 주말·휴일을 시작일로 넣으면 KRX 가 빈 응답을 줌). 시작일 기준가가 직전 월말 종가와 맞는지 검증해
+       90% 이상 일치하면 KRX 값을 전부 쓰고(불일치분은 분할·증자 보정분), 낮으면 종목별로 기준가가 맞거나 주식수 변동으로
+       설명되는 종목만 KRX 값, 나머지는 종가 기반(상장주식수 변동 보정)으로 씁니다(hybrid). 조회 자체가 실패한 달은 종가 기반.
   3. PER/PBR/배당수익률(ALL): PER·PBR·EPS·BPS·DIV (KRX 가 그날 공표한 값 → 미래 정보 없음)
+  거래일 달력은 KOSPI 지수(1001) 일별 종가에서 연 단위로 받아 캐시합니다(10년 ≈ 11회). factor_month_debug 로 월별 품질을 봅니다.
   메모리: 월말 1개 ≈ 0.35MB, 133개 ≈ 50MB. 종목코드는 screener._intern 으로 공유해 문자열 누수를 막습니다.
   서버 시작 시 screener 의 일별 prefetch 가 끝난 뒤에 시작합니다(KRX 동시 호출 방지). FACTOR_PREFETCH=0 이면 자동 시작 안 함.
 
@@ -216,30 +219,57 @@ def _fetch_prices_fallback(ymd: str) -> pd.DataFrame:
     return out
 
 
+_last_change_error: dict[str, Any] = {"when": None, "error": None}
+
+
 def _fetch_change(start: str, end: str) -> pd.DataFrame:
-    """전종목등락률(ALL, 수정주가). 반환: index=ticker, 열: base(시작일 기준가), close_e, ret(소수), vol, val. 실패 시 빈 DF."""
+    """전종목등락률(ALL, 수정주가). 반환: index=ticker, 열: base(시작일 기준가), close_e, ret(소수), vol, val. 실패 시 빈 DF.
+
+    KRX 엔드포인트(MDCSTAT01602)를 직접 호출해 직접 파싱합니다(pykrx 래퍼는 오류를 삼키고 빈 표를 돌려주며,
+    기준가를 int32 로 바꾸다 소수점·'-' 값에서 실패할 수 있음). 직접 호출이 안 되면 pykrx 래퍼로 폴백."""
     df = None
-    try:
-        if _krx_wrap is not None and hasattr(_krx_wrap, "get_market_price_change_by_ticker"):
-            df = _retry(_krx_wrap.get_market_price_change_by_ticker, start, end, "ALL", True, tries=2)
-        else:
-            df = _retry(stock.get_market_price_change, start, end, market="ALL", adjusted=True, tries=2)
-    except Exception as e:  # noqa: BLE001
-        log.warning("전종목등락률 실패 %s~%s: %s", start, end, e)
-        df = None
-    if df is None or df.empty or "시가" not in df.columns or "종가" not in df.columns:
+    if _krx_core is not None and hasattr(_krx_core, "전종목등락률"):
+        try:
+            raw = _retry(_krx_core.전종목등락률().fetch, start, end, "ALL", 2, tries=2)
+            if raw is not None and not raw.empty and "ISU_SRT_CD" in raw.columns:
+                df = pd.DataFrame({"base": _num(raw["BAS_PRC"]).values if "BAS_PRC" in raw.columns else np.nan,
+                                   "close_e": _num(raw["TDD_CLSPRC"]).values,
+                                   "rate": _num(raw["FLUC_RT"]).values if "FLUC_RT" in raw.columns else np.nan,
+                                   "vol": _num(raw["ACC_TRDVOL"]).values if "ACC_TRDVOL" in raw.columns else np.nan,
+                                   "val": _num(raw["ACC_TRDVAL"]).values if "ACC_TRDVAL" in raw.columns else np.nan},
+                                  index=pd.Index(raw["ISU_SRT_CD"].astype(str).str.strip().values, name="ticker"))
+        except Exception as e:  # noqa: BLE001
+            _last_change_error.update(when=f"{start}~{end}", error=f"{type(e).__name__}: {e}")
+            log.warning("전종목등락률(core) 실패 %s~%s: %s", start, end, e)
+            df = None
+    if df is None or df.empty:
+        try:
+            if _krx_wrap is not None and hasattr(_krx_wrap, "get_market_price_change_by_ticker"):
+                w = _retry(_krx_wrap.get_market_price_change_by_ticker, start, end, "ALL", True, tries=2)
+            else:
+                w = _retry(stock.get_market_price_change, start, end, market="ALL", adjusted=True, tries=2)
+            if w is not None and not w.empty and "시가" in w.columns and "종가" in w.columns:
+                df = pd.DataFrame({"base": _num(w["시가"]).values, "close_e": _num(w["종가"]).values,
+                                   "rate": _num(w["등락률"]).values if "등락률" in w.columns else np.nan,
+                                   "vol": _num(w["거래량"]).values if "거래량" in w.columns else np.nan,
+                                   "val": _num(w["거래대금"]).values if "거래대금" in w.columns else np.nan},
+                                  index=pd.Index(w.index.astype(str).str.strip(), name="ticker"))
+        except Exception as e:  # noqa: BLE001
+            _last_change_error.update(when=f"{start}~{end}", error=f"{type(e).__name__}: {e}")
+            log.warning("전종목등락률(wrap) 실패 %s~%s: %s", start, end, e)
+            df = None
+    if df is None or df.empty:
         return pd.DataFrame()
-    base = _num(df["시가"])            # pykrx 는 BAS_PRC(시작일 기준가)를 '시가'로 이름 붙임
-    close = _num(df["종가"])
+    df = df[~df.index.duplicated()]
+    base, close = df["base"], df["close_e"]
     ret = close / base.where(base > 0) - 1.0
-    if "등락률" in df.columns:
-        r2 = _num(df["등락률"]) / 100.0
-        ret = r2.where(r2.notna() & (base > 0), ret)
+    r2 = df["rate"] / 100.0
+    ret = r2.where(r2.notna() & (base > 0), ret)
     out = pd.DataFrame({"base": base.values, "close_e": close.values, "ret": ret.values,
-                        "vol": _num(df["거래량"]).values if "거래량" in df.columns else np.nan,
-                        "val": _num(df["거래대금"]).values if "거래대금" in df.columns else np.nan},
-                       index=pd.Index(df.index.astype(str).str.strip(), name="ticker"))
-    return out[~out.index.duplicated()]
+                        "vol": df["vol"].values, "val": df["val"].values}, index=df.index)
+    if out["base"].fillna(0).sum() == 0:           # 전부 '-' 면 조회 실패와 같음
+        return pd.DataFrame()
+    return out
 
 
 def _fetch_fund(ymd: str) -> pd.DataFrame:
@@ -259,31 +289,71 @@ def _fetch_fund(ymd: str) -> pd.DataFrame:
     return out[~out.index.duplicated()]
 
 
-def _index_series(code: str, start: str, end: str) -> pd.Series | None:
-    """지수 종가(일별, 인덱스 'YYYYMMDD'). 긴 기간은 1년 단위로 나눠 받는다."""
-    key = (code, start, end)
+def _index_year(code: str, year: int, upto: str) -> pd.Series | None:
+    """지수 종가 1년 치(일별, 인덱스 'YYYYMMDD'). 연도 단위로 캐시. 현재 연도는 upto(오늘)까지 받고 캐시하지 않는다."""
+    key = (code, str(year), "")
     if key in _index_cache:
         return _index_cache[key]
-    parts = []
-    s, e = _parse(start), _parse(end)
-    cur = s
+    start = f"{year}0101"
+    end = f"{year}1231" if f"{year}1231" <= upto else upto
+    out = None
     try:
-        while cur <= e:
-            nxt = min(datetime(cur.year, 12, 31), e)
-            df = _retry(stock.get_index_ohlcv, _ymd(cur), _ymd(nxt), code, tries=2)
-            if df is not None and not df.empty and "종가" in df.columns:
-                ser = df["종가"].astype(float)
-                ser.index = [d.strftime("%Y%m%d") for d in pd.to_datetime(ser.index)]
-                parts.append(ser)
-            _sleep()
-            cur = nxt + timedelta(days=1)
+        df = _retry(stock.get_index_ohlcv, start, end, code, tries=2)
+        if df is not None and not df.empty and "종가" in df.columns:
+            ser = df["종가"].astype(float)
+            ser.index = [d.strftime("%Y%m%d") for d in pd.to_datetime(ser.index)]
+            out = ser[~ser.index.duplicated()].sort_index()
     except Exception as ex:  # noqa: BLE001
-        log.warning("지수 조회 실패(%s): %s", code, ex)
-    out = pd.concat(parts).sort_index() if parts else None
-    if out is not None:
-        out = out[~out.index.duplicated()]
-    _index_cache[key] = out
+        log.warning("지수 조회 실패(%s, %d): %s", code, year, ex)
+    _sleep()
+    if end == f"{year}1231":          # 지난 연도만 캐시(올해는 매일 늘어남)
+        _index_cache[key] = out
     return out
+
+
+def _index_series(code: str, start: str, end: str) -> pd.Series | None:
+    """지수 종가(일별, 인덱스 'YYYYMMDD'), start~end. 연도 캐시를 이어 붙인다."""
+    parts = []
+    today = _ymd(_today())
+    for y in range(int(start[:4]), int(end[:4]) + 1):
+        s = _index_year(code, y, today)
+        if s is not None and len(s):
+            parts.append(s)
+    if not parts:
+        return None
+    out = pd.concat(parts).sort_index()
+    out = out[~out.index.duplicated()]
+    return out[(out.index >= start) & (out.index <= end)]
+
+
+_calendar: dict[str, Any] = {"days": [], "from": None, "to": None}     # KOSPI 지수가 있는 날 = 거래일
+
+
+def _ensure_calendar(start: str, end: str) -> list[str]:
+    """start~end 거래일 목록(오름차순). KOSPI(1001) 지수 일별 데이터에서 만든다. 실패하면 빈 목록."""
+    if _calendar["from"] and _calendar["to"] and _calendar["from"] <= start and _calendar["to"] >= end:
+        return [d for d in _calendar["days"] if start <= d <= end]
+    s = _index_series("1001", start, end)
+    if s is None or len(s) == 0:
+        return []
+    days = sorted(set(_calendar["days"]) | set(s.index))
+    _calendar["days"] = days
+    _calendar["from"] = min(start, _calendar["from"] or start)
+    _calendar["to"] = max(end, _calendar["to"] or end)
+    return [d for d in days if start <= d <= end]
+
+
+def _next_trading_day(ymd: str) -> str:
+    """ymd 다음 거래일(달력이 있을 때). 없으면 ymd+1일(주말이면 월요일)."""
+    days = _calendar["days"]
+    if days:
+        i = np.searchsorted(np.array(days), ymd, side="right")
+        if i < len(days):
+            return days[i]
+    d = _parse(ymd) + timedelta(days=1)
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return _ymd(d)
 
 
 # ────────────────────────────────────────────────────────────
@@ -337,7 +407,7 @@ def _build_snapshot(ymd: str, prices: pd.DataFrame, chg: pd.DataFrame | None, fu
     snap["common"] = np.array([1.0 if _is_common(t, n, m) else 0.0 for t, n, m in zip(idx, names, markets)])
     snap["managed"] = prices["sect"].astype(str).str.contains("관리|환기").astype(float)
 
-    meta: dict[str, Any] = {"ret_source": "none", "base_match_pct": None}
+    meta: dict[str, Any] = {"ret_source": "none", "base_match_pct": None, "krx_used_pct": None}
     has_prev = prev is not None and len(prev) > 0
     ret_close = _close_based_ret(snap["close"], snap["shares"], prev) if has_prev else pd.Series(np.nan, index=idx)
     ret = ret_close.copy()
@@ -349,10 +419,26 @@ def _build_snapshot(ymd: str, prices: pd.DataFrame, chg: pd.DataFrame | None, fu
         if has_prev:
             pct = _base_match_pct(chg, prev, idx)
             meta["base_match_pct"] = pct
-            # 기준가의 90% 이상이 직전 월말 종가와 일치해야 '직전월말→이번월말' 구간으로 인정 (나머지 불일치는 분할 등 보정분).
+            valid = krx_ret.notna() & ret_close.notna()
             if pct is not None and pct >= BASE_MATCH_MIN:
+                # 기준가의 90% 이상이 직전 월말 종가와 일치 → 구간 해석이 맞음. 불일치분은 분할·증자 등 KRX 보정분이므로 KRX 값을 전부 신뢰.
                 ret = krx_ret.where(krx_ret.notna(), ret_close)
                 meta["ret_source"] = "krx_adj"
+                meta["krx_used_pct"] = round(float(krx_ret.notna()[valid].mean()) * 100, 1) if int(valid.sum()) else None
+            else:
+                # 구간 해석이 불확실한 달: 종목별로 기준가가 직전 월말 종가와 맞거나(base_ok), 상장주식수 변동으로 설명되면(분할·무상증자:
+                # share_ok) KRX 값을, 아니면 종가 기반을 쓴다.
+                pc = prev["close"].reindex(idx)
+                ps = prev["shares"].reindex(idx)
+                base_ok = ((c["base"] / pc.where(pc > 0) - 1.0).abs() < 0.005)
+                sr = snap["shares"] / ps.where(ps > 0)
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    # 주식수가 실제로 바뀐(±5% 초과) 종목에서, 기준가 변화가 그 비율로 설명되면 KRX 보정값으로 인정
+                    share_ok = sr.notna() & (np.log(sr).abs() > 0.05) & (np.log((c["base"] / pc.where(pc > 0)) * sr).abs() < 0.03)
+                use = krx_ret.notna() & (base_ok.fillna(False) | share_ok.fillna(False))
+                ret = krx_ret.where(use, ret_close)
+                meta["ret_source"] = "hybrid"
+                meta["krx_used_pct"] = round(float(use[valid].mean()) * 100, 1) if int(valid.sum()) else None
         else:
             ret = krx_ret                       # 첫 스냅샷: 검증 불가, KRX 값 그대로
             meta["ret_source"] = "krx_adj_unverified"
@@ -375,8 +461,19 @@ def _build_snapshot(ymd: str, prices: pd.DataFrame, chg: pd.DataFrame | None, fu
 
 
 def _find_month_end(y: int, m: int) -> tuple[str | None, pd.DataFrame | None]:
-    """(연, 월)의 마지막 거래일과 그날의 전종목시세. 월말부터 거슬러 최대 10일."""
+    """(연, 월)의 마지막 거래일과 그날의 전종목시세.
+    거래일 달력(KOSPI 지수)이 있으면 그 달의 마지막 거래일을 바로 쓰고, 없으면 월말부터 거슬러 최대 10일 탐색."""
     last = calendar.monthrange(y, m)[1]
+    first_s, last_s = f"{y}{m:02d}01", f"{y}{m:02d}{last:02d}"
+    cal = [d for d in _calendar["days"] if first_s <= d <= last_s]
+    if cal:
+        ymd = cal[-1]
+        df = _fetch_prices(ymd)
+        _sleep()
+        if df is not None and not df.empty:
+            _month_end[(y, m)] = ymd
+            return ymd, df
+        # 달력과 다르면(지수는 있는데 종목 시세가 없음 — 드묾) 탐색으로
     d = datetime(y, m, last)
     for _ in range(10):
         ymd = _ymd(d)
@@ -396,35 +493,46 @@ def _find_month_end(y: int, m: int) -> tuple[str | None, pd.DataFrame | None]:
 
 
 def _fetch_change_verified(prev_ymd: str | None, ymd: str, prev_df: pd.DataFrame | None,
-                           idx: pd.Index) -> tuple[pd.DataFrame, float | None]:
-    """직전 월말→이번 월말 등락률. 시작일 해석 모드를 첫 달에 자동 판별(기준가 일치율이 높은 쪽)."""
+                           idx: pd.Index) -> tuple[pd.DataFrame, float | None, str | None]:
+    """직전 월말→이번 월말 등락률. 시작일은 '직전 월말의 다음 거래일'(그날의 기준가 = 직전 월말 종가).
+    기준가 일치율이 낮으면 시작일을 직전 월말 당일로 바꿔 한 번 더 시도하고, 더 잘 맞는 쪽을 쓴다.
+    반환: (등락률 표, 기준가 일치율, 사용한 시작일)."""
     if prev_ymd is None:
         start = _ymd(_parse(ymd).replace(day=1))
         chg = _fetch_change(start, ymd)
         _sleep()
-        return chg, None
-    modes = [_chg_mode["mode"]] if _chg_mode["mode"] else ["next_day", "same_day"]
-    best: tuple[str, pd.DataFrame, float | None] | None = None
+        return chg, None, start
+    first = _chg_mode["mode"] or "next_trading_day"
+    modes = [first] + [m for m in ("next_trading_day", "same_day") if m != first]
+    best: tuple[str, pd.DataFrame, float | None, str] | None = None
     for mode in modes:
-        start = _ymd(_parse(prev_ymd) + timedelta(days=1)) if mode == "next_day" else prev_ymd
+        start = _next_trading_day(prev_ymd) if mode == "next_trading_day" else prev_ymd
+        if start > ymd:
+            continue
         chg = _fetch_change(start, ymd)
         _sleep()
         pct = _base_match_pct(chg, prev_df, idx)
         if best is None or (pct if pct is not None else -1) > (best[2] if best[2] is not None else -1):
-            best = (mode, chg, pct)
+            best = (mode, chg, pct, start)
         if pct is not None and pct >= BASE_MATCH_MIN:
             break
-    assert best is not None
+    if best is None:
+        return pd.DataFrame(), None, None
     if _chg_mode["mode"] is None and best[2] is not None and best[2] >= BASE_MATCH_MIN:
         _chg_mode["mode"] = best[0]
         log.info("전종목등락률 시작일 해석: %s (기준가 일치 %.1f%%)", best[0], best[2])
-    return best[1], best[2]
+    return best[1], best[2], best[3]
 
 
 def ensure_months(n_months: int) -> list[str]:
     """최근 n_months 개 월말 스냅샷을 (없으면 받아서) 캐시에 채우고, 날짜 목록(오름차순)을 돌려준다."""
     global _names_latest
     months = _month_list(n_months)
+    # 거래일 달력(KOSPI 지수 일별): 월말 거래일과 '직전 월말 다음 거래일'을 정확히 잡기 위해 먼저 받는다(연 1회 호출).
+    y0, m0 = months[0]
+    cal = _ensure_calendar(f"{y0}{m0:02d}01", _ymd(_today()))
+    if not cal:
+        log.warning("거래일 달력(KOSPI 지수)을 받지 못해 월말 탐색·시작일 추정으로 진행합니다")
     dates: list[str] = []
     prev_ymd: str | None = None
     prev_df: pd.DataFrame | None = None
@@ -443,11 +551,13 @@ def ensure_months(n_months: int) -> list[str]:
         if ymd is None or prices is None:
             _state["last_error"] = f"{y}-{m:02d} 월말 거래일을 찾지 못함"
             continue
-        chg, _pct = _fetch_change_verified(prev_ymd, ymd, prev_df, prices.index)
+        chg, _pct, chg_start = _fetch_change_verified(prev_ymd, ymd, prev_df, prices.index)
         fund = _fetch_fund(ymd)
         _sleep()
         snap, meta = _build_snapshot(ymd, prices, chg, fund, prev_df)
         meta["prev"] = prev_ymd
+        meta["chg_start"] = chg_start
+        meta["chg_empty"] = bool(chg is None or chg.empty)
         names = {_intern(t): str(n) for t, n in zip(prices.index, prices["name"].astype(str))}
         with _lock:
             _snaps[ymd] = snap
@@ -501,21 +611,75 @@ def prefetch(years: float | None = None) -> dict[str, Any]:
 def cache_status() -> dict[str, Any]:
     with _lock:
         dates = sorted(_snaps)
-        srcs = [m.get("ret_source") for m in _snap_meta.values()]
-        matches = [m.get("base_match_pct") for m in _snap_meta.values() if m.get("base_match_pct") is not None]
-        fund_ok = sum(1 for m in _snap_meta.values() if m.get("fund_ok"))
+        metas = {d: _snap_meta.get(d, {}) for d in dates}
+    srcs = [m.get("ret_source") for m in metas.values()]
+    matches = [m.get("base_match_pct") for m in metas.values() if m.get("base_match_pct") is not None]
+    fund_ok = sum(1 for m in metas.values() if m.get("fund_ok"))
     st = dict(_state)
     out = {"cached_month_ends": len(dates), "earliest": dates[0] if dates else None, "latest": dates[-1] if dates else None,
            "prefetch": st, "process_rss_mb": _rss_mb(),
-           "return_source": {"krx_adjusted": srcs.count("krx_adj"), "close_fallback": srcs.count("close"),
-                             "unverified_first": srcs.count("krx_adj_unverified"), "none": srcs.count("none"),
+           "calendar_days": len(_calendar["days"]),
+           "return_source": {"krx_adjusted": srcs.count("krx_adj"), "hybrid": srcs.count("hybrid"),
+                             "close_fallback": srcs.count("close"), "unverified_first": srcs.count("krx_adj_unverified"),
+                             "none": srcs.count("none"),
                              "base_match_pct_avg": round(float(np.mean(matches)), 1) if matches else None,
-                             "start_date_mode": _chg_mode["mode"]},
+                             "months_change_empty": sum(1 for m in metas.values() if m.get("chg_empty")),
+                             "start_date_mode": _chg_mode["mode"], "last_change_error": dict(_last_change_error)},
            "fundamental_months": fund_ok,
-           "note": "backtest_factors 는 (years×12 + 13)개 월말이 있어야 전 기간을 계산합니다. 부족하면 있는 만큼 계산합니다."}
+           "note": "backtest_factors 는 (years×12 + 13)개 월말이 있어야 전 기간을 계산합니다. 부족하면 있는 만큼 계산합니다. "
+                   "월별 상세는 factor_month_debug 로 확인합니다."}
     if st["running"] and st["target"]:
         out["progress"] = f"{st['done']}/{st['target']} 월말 (월말당 KRX 3회, 약 5~7초)"
     return out
+
+
+def month_debug(ymd: str = "", n: int = 20) -> dict[str, Any]:
+    """월별 데이터 품질 진단. ymd 가 비면 모든 월말의 [월말, 수익률출처, 기준가일치율, KRX사용비율, 등락률시작일, 상장수] 표.
+    ymd 를 주면 그 달의 전종목등락률을 다시 받아 기준가가 직전 월말 종가와 다른 종목 n 개를 보여준다."""
+    with _lock:
+        dates = sorted(_snaps)
+        metas = {d: dict(_snap_meta.get(d, {})) for d in dates}
+    if not ymd:
+        rows = [[d, m.get("ret_source"), m.get("base_match_pct"), m.get("krx_used_pct"), m.get("chg_start"), m.get("n")]
+                for d, m in metas.items()]
+        return {"ok": True, "columns": ["month_end", "ret_source", "base_match_pct", "krx_used_pct", "chg_start", "listed"],
+                "rows": rows, "calendar_days": len(_calendar["days"]), "start_date_mode": _chg_mode["mode"],
+                "last_change_error": dict(_last_change_error)}
+    ymd = str(ymd).replace("-", "")
+    if ymd not in metas:
+        return {"ok": False, "error": f"{ymd} 는 캐시된 월말이 아닙니다. 캐시된 월말: {dates[:3]} … {dates[-3:]}"}
+    meta = metas[ymd]
+    prev_ymd = meta.get("prev")
+    if not prev_ymd:
+        return {"ok": True, "month_end": ymd, "meta": meta, "note": "첫 스냅샷이라 직전 월말이 없습니다."}
+    with _lock:
+        prev = _snaps[prev_ymd]
+        cur = _snaps[ymd]
+    start = meta.get("chg_start") or _next_trading_day(prev_ymd)
+    chg = _fetch_change(start, ymd)
+    if chg is None or chg.empty:
+        return {"ok": True, "month_end": ymd, "meta": meta, "refetch": {"start": start, "result": "빈 응답",
+                                                                     "last_change_error": dict(_last_change_error)}}
+    idx = cur.index
+    c = chg.reindex(idx)
+    pc = prev["close"].reindex(idx)
+    ps = prev["shares"].reindex(idx)
+    both = c["base"].notna() & pc.notna() & (pc > 0) & (c["base"] > 0)
+    ratio = c["base"] / pc.where(pc > 0)
+    mism = both & ((ratio - 1.0).abs() >= 0.005)
+    names = _names_latest[1] if _names_latest else {}
+    rows = []
+    for t in idx[mism.to_numpy()][: int(n)]:
+        sr = float(cur["shares"].get(t, np.nan) / ps.get(t, np.nan)) if ps.get(t, 0) else None
+        rows.append({"code": t, "name": names.get(t, t), "prev_close": float(pc[t]), "krx_base": float(c["base"][t]),
+                     "base_over_prev": round(float(ratio[t]), 4), "shares_ratio": None if sr is None or np.isnan(sr) else round(sr, 4),
+                     "krx_ret_pct": None if pd.isna(c["ret"][t]) else round(float(c["ret"][t]) * 100, 2),
+                     "cur_close": float(cur["close"].get(t, np.nan)),
+                     "used_ret_pct": None if pd.isna(cur["ret"].get(t, np.nan)) else round(float(cur["ret"][t]) * 100, 2)})
+    return {"ok": True, "month_end": ymd, "prev_month_end": prev_ymd, "meta": meta,
+            "refetch": {"start": start, "compared": int(both.sum()), "mismatch": int(mism.sum()),
+                        "match_pct": round(float((both & ~mism).sum()) / int(both.sum()) * 100, 1) if int(both.sum()) else None},
+            "mismatch_samples": rows}
 
 
 # ────────────────────────────────────────────────────────────
@@ -823,11 +987,15 @@ def _data_quality(dates: list[str]) -> dict[str, Any]:
         metas = [_snap_meta.get(d, {}) for d in dates]
     src = [m.get("ret_source") for m in metas]
     bm = [m.get("base_match_pct") for m in metas if m.get("base_match_pct") is not None]
-    return {"months_krx_adjusted_return": src.count("krx_adj"), "months_close_fallback": src.count("close"),
+    ku = [m.get("krx_used_pct") for m in metas if m.get("krx_used_pct") is not None]
+    return {"months_krx_adjusted_return": src.count("krx_adj"), "months_hybrid": src.count("hybrid"),
+            "months_close_fallback": src.count("close"),
             "base_price_match_pct_avg": round(float(np.mean(bm)), 1) if bm else None,
+            "krx_return_used_pct_avg": round(float(np.mean(ku)), 1) if ku else None,
             "start_date_mode": _chg_mode["mode"],
             "months_with_fundamentals": sum(1 for m in metas if m.get("fund_ok")),
-            "avg_listed": int(round(float(np.mean([m.get("n", 0) for m in metas])))) if metas else None}
+            "avg_listed": int(round(float(np.mean([m.get("n", 0) for m in metas])))) if metas else None,
+            "note": "krx_adjusted: KRX 수정주가 수익률 전부 사용. hybrid: 기준가가 맞는 종목만 KRX, 나머지 종가 기반. close_fallback: 등락률 조회 실패."}
 
 
 def run_backtest(factors: Any = DEFAULT_FACTORS, min_cap_억: float = 1000, years: float = 10, top_pct: float = 10,
@@ -996,7 +1164,7 @@ def _latest_trading_snapshot() -> tuple[str, pd.DataFrame, dict[str, str]] | Non
             _holidays.add(ymd)
             d -= timedelta(days=1)
             continue
-        chg, _pct = _fetch_change_verified(prev_ymd, ymd, prev_df, prices.index)
+        chg, _pct, _start = _fetch_change_verified(prev_ymd, ymd, prev_df, prices.index)
         fund = _fetch_fund(ymd)
         snap, meta = _build_snapshot(ymd, prices, chg, fund, prev_df)
         names = {str(t): str(n) for t, n in zip(prices.index, prices["name"].astype(str))}
