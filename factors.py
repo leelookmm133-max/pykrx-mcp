@@ -1236,5 +1236,188 @@ def run_screen(factors: Any = DEFAULT_FACTORS, min_cap_억: float = 1000, top_n:
             "source": "KRX via pykrx"}
 
 
+# ────────────────────────────────────────────────────────────
+# 표본 외(paper) 검증 — 사전 등록된 규칙. 이 블록은 수정하지 않습니다.
+#
+#   표본 내(2016-11~2026-10) 검증을 마친 뒤 2026-11-07 에 규칙을 고정했습니다. GitHub 커밋 시각이 등록 증거입니다.
+#   이후 월말마다 같은 규칙으로 30종목을 편입해 12개월 보유(코호트 겹침)하고, 2028-10 수익률월까지 24개월의
+#   표본 외 성과를 모아 판정합니다. 규칙·유니버스·판정 기준을 바꾸면 표본 외 검증의 의미가 사라집니다.
+# ────────────────────────────────────────────────────────────
+REGISTRATION: dict[str, Any] = {
+    "name": "저PBR 상위 30종목 · 12개월 보유 (표본 외 검증)",
+    "registered_on": "2026-11-07",
+    "rule": {
+        "signal": "KRX 공표 PBR 이 낮은 순(= 1/PBR 높은 순, PBR>0) 상위 30종목. 동점은 종목코드 순",
+        "universe": "보통주(우선주·스팩·코넥스 제외), 관리·환기종목 제외, 시가총액 1,000억 이상, 주가 1,000원 이상",
+        "formation": "매월 마지막 거래일 종가 기준으로 편입, 동일가중",
+        "holding": "12개월 보유 후 교체. 매월 새 코호트가 생겨 최대 12개 코호트를 동시에 보유(코호트 안에서는 월간 동일가중 재조정 가정)",
+        "benchmark": "같은 달 유니버스 동일가중 평균(주 비교 대상), 종목별 시장 지수(KOSPI/KOSDAQ) 참고",
+        "costs": "거래비용·세금 미반영(표본 내와 동일 기준으로 비교하기 위함)",
+    },
+    "params": {"factors": "bm", "top_n": 30, "hold_months": 12, "min_cap_eok": 1000, "min_price": 1000, "exclude_managed": True},
+    "oos_first_formation": "20261030",      # 이 월말부터 형성된 코호트의 수익률이 표본 외
+    "oos_first_return_month": "2026-11",
+    "verdict_month": "2028-10",             # 24개월(2026-11 ~ 2028-10)
+    "verdict_rule": "표본 외 24개월: 월평균 초과수익(유니버스 대비) +0.3%p 이상 그리고 월 적중률 55% 이상 → 통과 / "
+                    "월평균 초과수익 0 이하 → 기각 / 그 사이 → 12개월 연장 후 재판정",
+    "in_sample_reference": {"period": "2016-11 ~ 2026-10 (120개월, 표본 내)", "avg_month_pct": 0.94, "universe_avg_month_pct": 0.33,
+                            "excess_pp": 0.61, "t": 1.77, "hit_pct": 53.3, "first_half_pp": 0.47, "second_half_pp": 0.76,
+                            "cagr_pct": 9.0, "universe_cagr_pct": 1.4, "index_cagr_pct": 9.7, "max_drawdown_pct": -47.9,
+                            "criteria_passed": "3/5 (①④⑤ 통과, ② t 1.64·③ 적중률 51.7% 미달 — 상위 10% 기준)"},
+    "in_sample_window": ("20161031", "20260930"),   # 재현 검사용 형성월 범위
+}
+
+
+def _overlap_port(sel: pd.DataFrame, ret: pd.DataFrame, mask: pd.DataFrame, dates: list[str], k: int,
+                  f_from: str, f_to: str, kflag: np.ndarray, kospi_m: pd.Series, kosdaq_m: pd.Series) -> list[list[Any]]:
+    """형성월 f_from~f_to 의 코호트(sel 행)를 k 개월 보유했을 때의 월별 [수익률월, 코호트수, 포트, 유니버스, 지수, 초과](소수)."""
+    acc: dict[str, list[float]] = {}
+    acc_idx: dict[str, list[float]] = {}
+    pos = {d: i for i, d in enumerate(dates)}
+    for d in dates:
+        if d < f_from or d > f_to:
+            continue
+        i = pos[d]
+        row = sel.loc[d].to_numpy()
+        if not row.any():
+            continue
+        for j in range(1, k + 1):
+            if i + j >= len(dates):
+                break
+            m = dates[i + j]
+            x = ret.loc[m].to_numpy()[row]
+            ok = ~np.isnan(x)
+            if not ok.any():
+                continue
+            acc.setdefault(m, []).append(float(x[ok].mean()))
+            im = np.where(kflag[row], kosdaq_m.get(m, np.nan), kospi_m.get(m, np.nan))
+            acc_idx.setdefault(m, []).append(float(np.nanmean(im)) if np.isfinite(im).any() else np.nan)
+    rows = []
+    for m in sorted(acc):
+        i = pos[m]
+        if i == 0:
+            continue
+        u = ret.loc[m].where(mask.loc[dates[i - 1]])
+        uni = float(u.mean()) if u.notna().any() else np.nan
+        port = float(np.mean(acc[m]))
+        idx = float(np.nanmean(acc_idx[m])) if acc_idx.get(m) and np.isfinite(acc_idx[m]).any() else np.nan
+        rows.append([m, len(acc[m]), port, uni, idx, port - uni])
+    return rows
+
+
+def _rows_summary(rows: list[list[Any]]) -> dict[str, Any]:
+    if not rows:
+        return {"months": 0}
+    port = pd.Series([r[2] for r in rows], dtype=float)
+    uni = pd.Series([r[3] for r in rows], dtype=float)
+    idx = pd.Series([r[4] for r in rows], dtype=float)
+    ex = port - uni
+    out = {"months": int(len(rows)), "avg_month_pct": round(float(port.mean()) * 100, 2),
+           "universe_avg_month_pct": round(float(uni.mean()) * 100, 2),
+           "excess_vs_universe_pp": round(float(ex.mean()) * 100, 2), "excess_t_stat": _tstat(ex),
+           "hit_rate_vs_universe_pct": round(float((ex > 0).mean()) * 100, 1),
+           "cum_port_pct": round((float(np.prod(1 + port)) - 1) * 100, 1),
+           "cum_universe_pct": round((float(np.prod(1 + uni)) - 1) * 100, 1)}
+    if idx.notna().any():
+        out["cum_index_pct"] = round((float(np.prod(1 + idx.dropna())) - 1) * 100, 1)
+        out["excess_vs_index_pp"] = round(float((port - idx).dropna().mean()) * 100, 2)
+    return out
+
+
+def run_paper_test(show_all_cohorts: bool = False) -> dict[str, Any]:
+    """사전 등록된 규칙(REGISTRATION)대로 표본 외 코호트를 계산해 보고한다. 규칙 파라미터는 받지 않는다."""
+    t0 = time.time()
+    reg = REGISTRATION
+    prm = reg["params"]
+    if _state["running"]:
+        st = dict(_state)
+        return {"ok": False, "status": "preparing", "message": f"월말 데이터를 받는 중입니다 ({st['done']}/{st['target']}). 몇 분 뒤 다시 실행하세요.",
+                "registration": reg}
+    # 직전 완료 달의 월말이 아직 없으면 받아온다(월초 자동 실행 대비, KRX 3회 + 지수 1회)
+    y, m = _last_complete_month()
+    me = _month_end.get((y, m), "?")
+    if me == "?" or (me is not None and me not in _snaps):
+        try:
+            ensure_months(int(round(DEFAULT_YEARS * 12)) + WARMUP_MONTHS)
+        except Exception as e:  # noqa: BLE001
+            log.warning("paper_test: 최신 월말 수집 실패: %s", e)
+    with _lock:
+        dates = sorted(_snaps)
+    if len(dates) < 2:
+        return {"ok": False, "error": "월말 데이터가 없습니다. factor_cache_status 확인.", "registration": reg}
+    P = _panels(dates)
+    mask = _universe_mask(P, float(prm["min_cap_eok"]) * 1e8, bool(prm["exclude_managed"]), float(prm["min_price"]))
+    ret = P["ret"]
+    bm = 1.0 / P["pbr"].where(P["pbr"] > 0)
+    order = (-bm.where(mask)).rank(axis=1, method="first")
+    sel = (order <= int(prm["top_n"])) & mask
+    kospi_m, kosdaq_m = _index_monthly(dates)
+    kflag = (P["kosdaq"].ffill().iloc[-1] > 0).to_numpy()      # 종목별 시장 구분(최신 행 기준; 이전·상폐 종목은 마지막 값)
+    k = int(prm["hold_months"])
+
+    oos_rows = _overlap_port(sel, ret, mask, dates, k, reg["oos_first_formation"], dates[-1], kflag, kospi_m, kosdaq_m)
+    oos = _rows_summary(oos_rows)
+    f0, f1 = reg["in_sample_window"]
+    ins_rows = _overlap_port(sel, ret, mask, dates, k, f0, f1, kflag, kospi_m, kosdaq_m)
+    ins_rows = [r for r in ins_rows if r[0] <= "20261030"]            # 표본 내 수익률월은 2026-10 까지
+    ins = _rows_summary(ins_rows)
+
+    # 판정 미리보기(판정월 전에는 '진행 중')
+    n = oos["months"]
+    latest_ret_month = oos_rows[-1][0] if oos_rows else None
+    verdict = "진행 중"
+    if n:
+        ex, hit = oos["excess_vs_universe_pp"], oos["hit_rate_vs_universe_pct"]
+        prelim = "통과" if (ex >= 0.3 and hit >= 55) else ("기각" if ex <= 0 else "연장(12개월 후 재판정)")
+        final = latest_ret_month is not None and f"{latest_ret_month[:4]}-{latest_ret_month[4:6]}" >= reg["verdict_month"]
+        verdict = f"판정: {prelim}" if final else f"진행 중 {n}/24개월 (지금 규칙을 적용하면 '{prelim}' — 판정은 {reg['verdict_month']} 수익률 반영 후)"
+
+    names = _names_latest[1] if _names_latest else {}
+    cohorts_out = []
+    pos = {d: i for i, d in enumerate(dates)}
+    for d in dates:
+        if d < reg["oos_first_formation"]:
+            continue
+        row = sel.loc[d]
+        tick = list(row.index[row.to_numpy()])
+        if not tick:
+            continue
+        i = pos[d]
+        held = min(k, len(dates) - 1 - i)
+        cum = None
+        if held > 0:
+            r = ret.loc[dates[i + 1]:dates[i + held], tick]
+            cum = round((float(np.prod(1 + r.mean(axis=1).fillna(0))) - 1) * 100, 2)
+        entry = {"formation": d, "n": len(tick), "months_held": held, "cum_return_pct": cum,
+                 "exit_after": dates[i + k] if i + k < len(dates) else f"{k}개월 뒤"}
+        if show_all_cohorts or d == dates[-1]:
+            entry["holdings"] = [{"code": t, "name": names.get(t, t), "entry_close": _num_or_none(P["close"].loc[d, t], 0),
+                                  "PBR": _num_or_none(P["pbr"].loc[d, t], 2), "cap_억": _num_or_none(P["cap"].loc[d, t], 0, 1e-8),
+                                  "market": "KOSDAQ" if P["kosdaq"].loc[d, t] > 0 else "KOSPI"} for t in tick]
+        else:
+            entry["codes"] = tick
+        cohorts_out.append(entry)
+
+    return {
+        "ok": True,
+        "registration": {k2: v for k2, v in reg.items() if k2 != "in_sample_window"},
+        "as_of_month_end": dates[-1],
+        "status": verdict,
+        "oos_summary": oos,
+        "oos_monthly_columns": ["수익률월", "코호트수", "포트_pct", "유니버스_pct", "지수_pct", "초과_pp"],
+        "oos_monthly": [[f"{r[0][:4]}-{r[0][4:6]}", r[1], round(r[2] * 100, 2), round(r[3] * 100, 2),
+                         None if (r[4] is None or np.isnan(r[4])) else round(r[4] * 100, 2), round(r[5] * 100, 2)] for r in oos_rows],
+        "cohorts": cohorts_out,
+        "in_sample_reproduction": {"note": "현재 캐시로 표본 내 구간을 같은 규칙으로 다시 계산한 값. registration.in_sample_reference 와 거의 같아야 함",
+                                   **ins},
+        "elapsed_sec": round(time.time() - t0, 1),
+        "note": "사전 등록된 규칙을 그대로 적용한 기록입니다. 규칙을 바꾸지 마세요. 과거·현재 통계이며 매매 권유가 아닙니다.",
+    }
+
+
+def _num_or_none(x, nd: int = 2, scale: float = 1.0):
+    return None if pd.isna(x) else round(float(x) * scale, nd)
+
+
 if os.environ.get("FACTOR_PREFETCH", "1") != "0":
     prefetch()

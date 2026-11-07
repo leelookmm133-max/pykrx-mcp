@@ -789,6 +789,17 @@ def backtest_factors(factors_spec: str = "value,quality,lowvol,mom", min_cap_eok
 
 
 @mcp.tool()
+def paper_test(show_all_cohorts: bool = False) -> dict[str, Any]:
+    """표본 외(paper) 검증 보고 — 2026-11-07 에 사전 등록한 규칙 '저PBR 상위 30종목·12개월 보유(시총 1,000억↑ 보통주)'를
+    그대로 적용합니다. 규칙 파라미터는 받지 않습니다(바꾸면 표본 외 검증이 아님).
+    돌려주는 것: registration(등록된 규칙·판정 규칙·표본 내 참고치), status(진행 n/24개월 또는 판정), oos_summary(표본 외 월평균
+    초과수익·적중률·t·누적 수익률 vs 유니버스·지수), oos_monthly, cohorts(이번 달 편입 30종목 포함; show_all_cohorts=True 면 모든
+    코호트의 종목), in_sample_reproduction(표본 내 구간 재계산 — 등록 참고치와 거의 같아야 함).
+    직전 완료 달의 월말 데이터가 없으면 먼저 받아옵니다(약 10초). 과거·현재 통계이며 매매 권유가 아닙니다."""
+    return factors.run_paper_test(show_all_cohorts=bool(show_all_cohorts))
+
+
+@mcp.tool()
 def screen_factors(factors_spec: str = "value,quality,lowvol,mom", min_cap_eok: float = 1000, top_n: int = 30,
                    exclude_managed: bool = True, min_price: float = 1000) -> dict[str, Any]:
     """최근 거래일 기준 팩터 복합점수 상위 종목(backtest_factors 와 같은 정의·유니버스). 종목별로 복합점수 백분위,

@@ -109,6 +109,7 @@ curl https://<이름>.up.railway.app/healthz
 | `factor_month_debug(ymd="", n=20)` | 월별 데이터 품질 표; ymd 를 주면 그 달 기준가가 직전 월말 종가와 다른 종목 샘플 |
 | `backtest_factors(factors_spec, min_cap_eok, years, top_pct, top_n, hold_months, …)` | 매월 말 유니버스 전종목을 팩터 백분위 순위로 점수화 → 상위 포트폴리오(동일가중) → 다음 달 수익률을 유니버스·지수와 비교. 10분위·IC·t-통계량·연도별·팩터별 단독 성과표 |
 | `screen_factors(factors_spec, min_cap_eok, top_n)` | 최근 거래일 기준 복합점수 상위 종목과 팩터 값 |
+| `paper_test(show_all_cohorts=False)` | **표본 외 검증 보고.** 2026-11-07 사전 등록 규칙(저PBR 상위 30종목·12개월 보유·시총 1,000억↑)을 그대로 적용해 이번 달 편입 종목, 표본 외 월별·누적 성과, 판정 상태를 돌려줌. 규칙 파라미터 없음(`factors.REGISTRATION` 수정 금지) |
 
 팩터: `value`(=`bm` 1/PBR + `ep` EPS/P + `dy` 배당수익률 순위 평균), `quality`(=`roe` EPS/BPS), `mom`(12-1개월 모멘텀),
 `rev`(1개월 반전·낮을수록 좋음), `lowvol`(12개월 저변동성), `high52`(52주고가 근접), `size`(소형주), `lowturn`(저회전율).
