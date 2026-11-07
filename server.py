@@ -678,6 +678,50 @@ def backtest_accumulation_exit(min_cap_eok: float = 1000, accum_mult: float = 1.
 
 
 @mcp.tool()
+def backtest_momentum(min_cap_eok: float = 1000, min_score: int = 4, r60_min_pct: float = 10.0,
+                      high_pct: float = -5.0, overheat_pct: float = 40.0, require_flow: bool = False,
+                      flow_mode: str = "any", per_max: float = 0, pbr_max: float = 0,
+                      hold_days: int = 20, horizons: str = "5,10,20,40", lookback_days: int = 500,
+                      step: int = 1, cap_mode: str = "scaled", cooldown: int = 20,
+                      max_signals_listed: int = 40) -> dict[str, Any]:
+    """
+    모멘텀형 신호의 백테스트(집계 방식은 backtest_volume_breakout 과 동일).
+    가격 조건 5개(60일 수익률>r60_min_pct, 20일 수익률>0, 종가>20일선>60일선, 52주 고점 high_pct 이내,
+    20일 평균 거래대금>직전 60일) 중 min_score 개 이상이면 신호. 20일 수익률이 overheat_pct 를 넘으면 과열로 제외.
+    require_flow=True 면 외국인/기관 20일 순매수(flow_mode any/both)도 요구(수급 준비에 시간이 걸릴 수 있음).
+    per_max/pbr_max 는 0 이면 미적용. by_spike_days 항목은 이 도구에서는 "점수별" 집계입니다.
+    결과는 과거 통계이며 매매 권유가 아닙니다.
+    """
+    return screener.run_backtest(min_cap_억=min_cap_eok, vol_mult=2.0, min_days=3,
+                                 ret_lo_pct=-100.0, ret_hi_pct=1000.0, dd_max_pct=-100.0,
+                                 hold_days=int(hold_days), step=int(step), require_flow=require_flow,
+                                 max_signals_listed=int(max_signals_listed), lookback_days=int(lookback_days),
+                                 horizons=horizons, cap_mode=cap_mode, cooldown=int(cooldown),
+                                 mode="momentum", per_max=(per_max if per_max and per_max > 0 else None),
+                                 pbr_max=(pbr_max if pbr_max and pbr_max > 0 else None), flow_mode=flow_mode,
+                                 mom_min_score=int(min_score), mom_r60_min=r60_min_pct / 100.0,
+                                 mom_high_pct=high_pct / 100.0, mom_overheat=overheat_pct / 100.0)
+
+
+@mcp.tool()
+def backtest_momentum_exit(min_cap_eok: float = 1000, min_score: int = 4, r60_min_pct: float = 10.0,
+                           high_pct: float = -5.0, overheat_pct: float = 40.0, require_flow: bool = False,
+                           flow_mode: str = "any", tp_pct: str = "15", sl_pct: str = "7", max_hold: str = "20",
+                           exit_mode: str = "intraday", cost_pct: float = 0.3, lookback_days: int = 500,
+                           step: int = 1, cap_mode: str = "scaled", max_trades_listed: int = 30) -> dict[str, Any]:
+    """모멘텀형 신호(backtest_momentum 과 같은 조건)에 익절·손절·최대보유 규칙을 적용한 거래 단위 백테스트.
+    tp_pct/sl_pct/max_hold 는 "10,15" 처럼 여러 값(조합 최대 12개). 결과는 과거 통계이며 매매 권유가 아닙니다."""
+    return screener.run_exit_backtest(min_cap_억=min_cap_eok, vol_mult=2.0, min_days=3,
+                                      ret_lo_pct=-100.0, ret_hi_pct=1000.0, dd_max_pct=-100.0,
+                                      tp_pct=tp_pct, sl_pct=sl_pct, max_hold=max_hold, exit_mode=exit_mode,
+                                      cost_pct=cost_pct, step=int(step), require_flow=require_flow,
+                                      lookback_days=int(lookback_days), cap_mode=cap_mode,
+                                      max_trades_listed=int(max_trades_listed), mode="momentum", flow_mode=flow_mode,
+                                      mom_min_score=int(min_score), mom_r60_min=r60_min_pct / 100.0,
+                                      mom_high_pct=high_pct / 100.0, mom_overheat=overheat_pct / 100.0)
+
+
+@mcp.tool()
 def screener_prefetch(days: int = 250) -> dict[str, Any]:
     """전종목 일별 데이터를 days 거래일만큼 백그라운드로 미리 받아 둡니다(백테스트 기간 확장용, 최대 500).
     바로 돌아오며, 진행률은 screener_cache_status 로 확인합니다."""

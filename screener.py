@@ -664,7 +664,9 @@ def signal_matrix(panel_close: pd.DataFrame, panel_vol: pd.DataFrame, *,
                   lookback_ret: int = 20, lookback_high: int = 60,
                   base_window: int = 20, recent_window: int = 5,
                   mode: str = "spike", accum_mult: float = 1.5, max_spike: float = 5.0,
-                  accum_window: int = 20, accum_base: int = 60) -> dict[str, pd.DataFrame]:
+                  accum_window: int = 20, accum_base: int = 60,
+                  mom_min_score: int = 4, mom_r60_min: float = 0.10, mom_high_pct: float = -0.05,
+                  mom_overheat: float = 0.40) -> dict[str, pd.DataFrame]:
     """compute_metrics 와 같은 정의를 패널 전체에 벡터화. 반환값은 모두 panel 과 같은 모양.
 
     - base: 최근 recent_window 일을 제외한 직전 base_window 일 평균 거래량
@@ -684,6 +686,27 @@ def signal_matrix(panel_close: pd.DataFrame, panel_vol: pd.DataFrame, *,
     high = c.rolling(lookback_high, min_periods=lookback_high).max()
     dd = c / high - 1.0
     today_ratio = v / base
+    if str(mode).lower().startswith("mom"):
+        # 모멘텀형: 가격 조건 5개 중 mom_min_score 개 이상 충족 (수급은 _signal_context 에서 별도 적용)
+        #   ① 60일 수익률 > mom_r60_min  ② 20일 수익률 > 0  ③ 종가 > 20일선 > 60일선
+        #   ④ 52주(최대 250일, 최소 120일) 종가 고점 대비 mom_high_pct 이내  ⑤ 20일 평균 거래대금 > 직전 60일 평균
+        #   과열 제외: 20일 수익률 > mom_overheat
+        r60 = c / c.shift(60) - 1.0
+        r20 = ret
+        ma20 = c.rolling(20, min_periods=20).mean()
+        ma60 = c.rolling(60, min_periods=60).mean()
+        hi52 = c.rolling(250, min_periods=120).max()
+        near_high = c / hi52 - 1.0
+        tv = v * c                                   # 거래대금 근사(거래량×종가)
+        tv20 = tv.rolling(20, min_periods=20).mean()
+        tv60p = tv.shift(20).rolling(60, min_periods=60).mean()
+        checks = [(r60 > mom_r60_min), (r20 > 0), ((c > ma20) & (ma20 > ma60)),
+                  (near_high >= mom_high_pct), (tv20 > tv60p)]
+        score = sum(ch.astype(int) for ch in checks)
+        valid = r60.notna() & hi52.notna() & tv60p.notna() & (c > 0) & ret.notna()
+        ok = valid & (score >= int(mom_min_score)) & (r20 <= mom_overheat)
+        return {"ok": ok, "valid": valid, "spike_days": score, "ret": ret, "dd": near_high, "today_ratio": today_ratio,
+                "r60": r60, "score": score}
     if str(mode).lower().startswith("accum"):
         # 누적 매집형: 최근 accum_window 일 평균 거래량이 그 이전 accum_base 일 평균의 accum_mult 배 이상이면서,
         # 그 기간 안에 하루 max_spike 배 이상 폭발한 날은 없음(뉴스·테마 반응 제외). 완만하게 쌓인 거래량만 잡는다.
@@ -744,7 +767,8 @@ def _signal_context(*, min_cap_억: float, vol_mult: float, min_days: int, ret_l
                     cap_mode: str, cooldown: int, need_ohlc: bool = False,
                     mode: str = "spike", accum_mult: float = 1.5, max_spike: float = 5.0,
                     per_max: float | None = None, pbr_max: float | None = None,
-                    flow_mode: str = "any") -> dict[str, Any]:
+                    flow_mode: str = "any", mom_min_score: int = 4, mom_r60_min: float = 0.10,
+                    mom_high_pct: float = -0.05, mom_overheat: float = 0.40) -> dict[str, Any]:
     """백테스트 공통 준비: 캐시 확인 → 패널 → 시총 → 조건 행렬 → (수급) → 첫 신호.
 
     준비가 안 됐으면 {"ok": False, "status": ...} 를, 됐으면 {"ok": True, ...패널과 행렬...} 을 돌려준다.
@@ -813,7 +837,9 @@ def _signal_context(*, min_cap_억: float, vol_mult: float, min_days: int, ret_l
     # 3) 조건 행렬
     sm = signal_matrix(panel_close, panel_vol, vol_mult=vol_mult, min_days=int(min_days),
                        ret_lo=ret_lo_pct / 100, ret_hi=ret_hi_pct / 100, dd_max=dd_max_pct / 100,
-                       mode=mode, accum_mult=accum_mult, max_spike=max_spike)
+                       mode=mode, accum_mult=accum_mult, max_spike=max_spike,
+                       mom_min_score=mom_min_score, mom_r60_min=mom_r60_min,
+                       mom_high_pct=mom_high_pct, mom_overheat=mom_overheat)
     ok = sm["ok"] & cap_ok
     universe = sm["valid"] & cap_ok
     # 3b) 저평가 조건(선택): PER·PBR 상한. 적자(PER<=0)·자본잠식(PBR<=0) 제외. 유니버스에도 같이 적용해 공정 비교.
@@ -866,9 +892,13 @@ def _signal_context(*, min_cap_억: float, vol_mult: float, min_days: int, ret_l
     entry = ok & (prev == 0)
 
     is_accum = str(mode).lower().startswith("accum")
-    conditions = {"신호유형": "누적매집형(accum)" if is_accum else "급증형(spike)",
+    is_mom = str(mode).lower().startswith("mom")
+    conditions = {"신호유형": "모멘텀형(momentum)" if is_mom else ("누적매집형(accum)" if is_accum else "급증형(spike)"),
                   "시가총액_억_이상": min_cap_억, "시가총액_기준": "신호일 가격으로 환산" if cap_mode == "scaled" else "최신 고정",
-                  "거래량": (f"최근 20일 평균 거래량이 이전 60일 평균의 {accum_mult}배 이상, 그 20일 안에 하루 {max_spike}배 이상 폭발한 날 없음"
+                  "거래량": (f"[모멘텀] 가격조건 5개(60일수익률>{mom_r60_min*100:.0f}%, 20일수익률>0, 종가>20일선>60일선, "
+                           f"52주고점 {mom_high_pct*100:.0f}% 이내, 20일 거래대금>직전60일) 중 {int(mom_min_score)}개 이상, "
+                           f"20일수익률 {mom_overheat*100:.0f}% 초과 과열 제외" if is_mom else
+                           f"최근 20일 평균 거래량이 이전 60일 평균의 {accum_mult}배 이상, 그 20일 안에 하루 {max_spike}배 이상 폭발한 날 없음"
                            if is_accum else f"20일평균(최근5일 제외) 대비 {vol_mult}배 이상이 최근 5일 중 {int(min_days)}일 이상"),
                   "저평가": val_note,
                   "20일등락률_pct": [ret_lo_pct, ret_hi_pct], "60일고점대비_pct": dd_max_pct,
@@ -886,7 +916,9 @@ def run_backtest(min_cap_억: float = 1000, vol_mult: float = 2.0, min_days: int
                  max_signals_listed: int = 40, lookback_days: int = 250,
                  horizons: Any = None, cap_mode: str = "scaled", cooldown: int = 20,
                  mode: str = "spike", accum_mult: float = 1.5, max_spike: float = 5.0,
-                 per_max: float | None = None, pbr_max: float | None = None, flow_mode: str = "any") -> dict[str, Any]:
+                 per_max: float | None = None, pbr_max: float | None = None, flow_mode: str = "any",
+                 mom_min_score: int = 4, mom_r60_min: float = 0.10, mom_high_pct: float = -0.05,
+                 mom_overheat: float = 0.40) -> dict[str, Any]:
     """캐시된 거래일(lookback_days)을 대상으로 날짜별 신호 → 여러 보유기간(horizons) 뒤 수익률 집계."""
     t0 = time.time()
     hold_days = int(hold_days)
@@ -896,7 +928,9 @@ def run_backtest(min_cap_억: float = 1000, vol_mult: float = 2.0, min_days: int
                           ret_hi_pct=ret_hi_pct, dd_max_pct=dd_max_pct, lookback_days=lookback_days,
                           min_forward=max_h, step=step, require_flow=require_flow, cap_mode=cap_mode,
                           cooldown=cooldown, mode=mode, accum_mult=accum_mult, max_spike=max_spike,
-                          per_max=per_max, pbr_max=pbr_max, flow_mode=flow_mode)
+                          per_max=per_max, pbr_max=pbr_max, flow_mode=flow_mode,
+                          mom_min_score=mom_min_score, mom_r60_min=mom_r60_min,
+                          mom_high_pct=mom_high_pct, mom_overheat=mom_overheat)
     if not ctx["ok"]:
         return ctx
     dates, tickers, panel_close = ctx["dates"], ctx["tickers"], ctx["panel_close"]
@@ -1197,7 +1231,9 @@ def run_exit_backtest(min_cap_억: float = 1000, vol_mult: float = 3.0, min_days
                       cost_pct: float = 0.3, step: int = 1, require_flow: bool = False, lookback_days: int = 250,
                       cap_mode: str = "scaled", max_trades_listed: int = 30,
                       mode: str = "spike", accum_mult: float = 1.5, max_spike: float = 5.0,
-                      per_max: float | None = None, pbr_max: float | None = None, flow_mode: str = "any") -> dict[str, Any]:
+                      per_max: float | None = None, pbr_max: float | None = None, flow_mode: str = "any",
+                      mom_min_score: int = 4, mom_r60_min: float = 0.10, mom_high_pct: float = -0.05,
+                      mom_overheat: float = 0.40) -> dict[str, Any]:
     """신호 조건은 run_backtest 와 같고, 청산을 익절/손절/최대보유 규칙으로 바꿔 거래 단위 성과를 집계."""
     t0 = time.time()
     tps = _parse_num_list(tp_pct, [10.0])
@@ -1212,7 +1248,9 @@ def run_exit_backtest(min_cap_억: float = 1000, vol_mult: float = 3.0, min_days
                           ret_hi_pct=ret_hi_pct, dd_max_pct=dd_max_pct, lookback_days=lookback_days,
                           min_forward=max(holds), step=step, require_flow=require_flow, cap_mode=cap_mode,
                           cooldown=20, need_ohlc=(exit_m == "intraday"), mode=mode, accum_mult=accum_mult,
-                          max_spike=max_spike, per_max=per_max, pbr_max=pbr_max, flow_mode=flow_mode)
+                          max_spike=max_spike, per_max=per_max, pbr_max=pbr_max, flow_mode=flow_mode,
+                          mom_min_score=mom_min_score, mom_r60_min=mom_r60_min,
+                          mom_high_pct=mom_high_pct, mom_overheat=mom_overheat)
     if not ctx["ok"]:
         return ctx
     dates, tickers = ctx["dates"], list(ctx["tickers"])
