@@ -104,6 +104,23 @@ GROUP_FACTORS: dict[str, list[str]] = {
 DEFAULT_FACTORS = "value,quality,lowvol,mom"
 ALL_FOR_TABLE = ["value", "bm", "ep", "dy", "roe", "mom", "rev", "lowvol", "high52", "size", "lowturn"]
 
+# 외부 모듈(signals.py 등)이 팩터를 추가하는 레지스트리. fn(P) -> 패널(행=날짜, 열=티커), P 는 raw_factors 가 받는 패널 dict.
+EXTRA_FACTORS: dict[str, Any] = {}
+
+
+def register_factor(name: str, higher_better: bool, desc: str, fn) -> None:
+    name = name.lower()
+    ATOMIC_FACTORS[name] = (bool(higher_better), desc)
+    EXTRA_FACTORS[name] = fn
+    if name not in ALL_FOR_TABLE:
+        ALL_FOR_TABLE.append(name)
+
+
+def register_group(name: str, members: list[str]) -> None:
+    GROUP_FACTORS[name.lower()] = [m.lower() for m in members]
+    if name.lower() not in ALL_FOR_TABLE:
+        ALL_FOR_TABLE.append(name.lower())
+
 CRITERIA = {"excess_pp": 0.3, "t": 2.0, "hit_pct": 55.0, "mono_rho": 0.7, "ic_ref": 0.02}
 
 
@@ -735,6 +752,13 @@ def raw_factors(P: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     F["high52"] = adj / adj.rolling(12, min_periods=9).max()
     F["size"] = cap
     F["lowturn"] = P["tval_m"] / cap.where(cap > 0)
+    for name, fn in EXTRA_FACTORS.items():
+        try:
+            out = fn(P)
+            F[name] = out.reindex(index=close.index, columns=close.columns).astype(float)
+        except Exception as e:  # noqa: BLE001
+            log.warning("추가 팩터 %s 계산 실패: %s", name, e)
+            F[name] = pd.DataFrame(np.nan, index=close.index, columns=close.columns)
     return F
 
 
@@ -951,10 +975,14 @@ def _single_factor_table(F: dict[str, pd.DataFrame], fwd: pd.DataFrame, uni_ret:
                          dates: list[str]) -> dict[str, Any]:
     """각 팩터를 단독으로 썼을 때: 상위 10%(D10) 초과수익·t·적중률·전후반, D10-D1, IC. '한국시장에서 무엇이 먹히나' 표."""
     table: dict[str, Any] = {}
-    R = factor_ranks(F, ALL_FOR_TABLE, mask)
+    names_all = [n for n in ALL_FOR_TABLE if n in ATOMIC_FACTORS or n in GROUP_FACTORS]
     uni_series = _to_return_month(uni_ret, dates, 1)
-    for n in ALL_FOR_TABLE:
-        r = R[n]
+    for n in names_all:
+        r = factor_ranks(F, [n], mask)[n]          # 팩터 하나씩 계산해 메모리 피크를 낮춘다(30개 동시 보유 방지)
+        if int(r.notna().to_numpy().sum()) == 0:
+            table[n] = {"설명": (" + ".join(GROUP_FACTORS[n]) + " 순위 평균" if n in GROUP_FACTORS else ATOMIC_FACTORS[n][1]),
+                        "months": 0, "note": "데이터 없음(신호 미수집 또는 DART 키 없음)"}
+            continue
         dec = _decile_of(r, mask)
         d10 = pd.DataFrame(dec == 10, index=r.index, columns=r.columns)
         d1 = pd.DataFrame(dec == 1, index=r.index, columns=r.columns)
@@ -970,7 +998,8 @@ def _single_factor_table(F: dict[str, pd.DataFrame], fwd: pd.DataFrame, uni_ret:
             bool(st.get("hit_rate_vs_universe_pct") is not None and st["hit_rate_vs_universe_pct"] >= CRITERIA["hit_pct"]),
             bool(st.get("excess_first_half_pp") is not None and st.get("excess_second_half_pp") is not None
                  and st["excess_first_half_pp"] > 0 and st["excess_second_half_pp"] > 0)])
-        desc = "가치 복합(1/PBR·EPS/P·배당 순위 평균)" if n == "value" else ATOMIC_FACTORS[n][1]
+        desc = ("가치 복합(1/PBR·EPS/P·배당 순위 평균)" if n == "value"
+                else (" + ".join(GROUP_FACTORS[n]) + " 순위 평균" if n in GROUP_FACTORS else ATOMIC_FACTORS[n][1]))
         table[n] = {"설명": desc, "months": st.get("months"),
                     "d10_excess_pp": st.get("excess_vs_universe_pp"), "d10_t": st.get("excess_t_stat"),
                     "d10_hit_pct": st.get("hit_rate_vs_universe_pct"),
@@ -1212,9 +1241,15 @@ def run_screen(factors: Any = DEFAULT_FACTORS, min_cap_억: float = 1000, top_n:
         x = s.get(t, np.nan)
         return None if pd.isna(x) else round(float(x) * scale, nd)
 
+    # 요청한 팩터에 포함된 추가 신호(signals.py 등록분)의 원값도 함께 보여준다
+    atoms: list[str] = []
+    for n in names_f:
+        for a in (GROUP_FACTORS[n] if n in GROUP_FACTORS else [n]):
+            if a in EXTRA_FACTORS and a not in atoms:
+                atoms.append(a)
     rows = []
     for t in row.index[: int(top_n)]:
-        rows.append({
+        item = {
             "code": t, "name": names.get(t) or fallback_names.get(t, t),
             "market": "KOSDAQ" if L["kosdaq"].get(t, 0) > 0 else "KOSPI",
             "close": _v(L["close"], t, 0), "cap_억": _v(L["cap"], t, 0, 1e-8),
@@ -1224,7 +1259,10 @@ def run_screen(factors: Any = DEFAULT_FACTORS, min_cap_억: float = 1000, top_n:
             "ROE_pct": _v(FL["roe"], t, 1, 100), "mom_12_1_pct": _v(FL["mom"], t, 1, 100),
             "ret_1m_pct": _v(FL["rev"], t, 1, 100), "vol_12m_pct": _v(FL["lowvol"], t, 1, 100),
             "high52_pct": _v(FL["high52"], t, 1, 100), "turnover_m_pct": _v(FL["lowturn"], t, 1, 100),
-        })
+        }
+        if atoms:
+            item["signals"] = {a: _v(FL[a], t, 4) for a in atoms if a in FL}
+        rows.append(item)
     return {"ok": True, "as_of": f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}",
             "method": {"팩터": names_f, "복합점수": "팩터 백분위 순위 평균 → 백분위(100 = 최상위)",
                        "유니버스": f"보통주(우선주·스팩·코넥스 제외){', 관리·환기종목 제외' if exclude_managed else ''}, "

@@ -33,6 +33,7 @@ from pykrx import stock
 import indicators          # 같은 폴더. 지표 계산을 서버에서 수행
 import screener            # 같은 폴더. 전종목 조건 스크리너
 import factors             # 같은 폴더. 학계식 팩터(횡단면 순위) 백테스트·스크리너 (월말 스냅샷 캐시)
+import signals             # 같은 폴더. 1단계 추가 신호(DART 재무·업종 모멘텀·수급·공매도) — factors 레지스트리에 팩터로 등록
 
 # MCP SDK 2.x 에서 FastMCP 가 MCPServer 로 이름이 바뀌었습니다.
 # 어느 버전이 깔려도 돌아가게 둘 다 시도합니다.
@@ -782,10 +783,26 @@ def backtest_factors(factors_spec: str = "value,quality,lowvol,mom", min_cap_eok
     top30_fixed(상위 30종목 고정 버전), by_year, monthly, single_factors(팩터별 단독 성과표 — 어떤 팩터가 한국에서
     먹히는지), data_quality. 캐시가 아직 없으면 status="preparing" 과 진행률을 돌려줍니다.
     결과는 과거 통계이며 매매 권유가 아닙니다."""
+    signals.refresh_recent_async()
     return factors.run_backtest(factors=factors_spec, min_cap_억=min_cap_eok, years=float(years), top_pct=float(top_pct),
                                 top_n=int(top_n), hold_months=int(hold_months), exclude_managed=bool(exclude_managed),
                                 min_price=float(min_price), include_single_factor_table=bool(include_single_factor_table),
                                 max_months_listed=int(max_months_listed))
+
+
+@mcp.tool()
+def signals_prefetch(years: float = 10) -> dict[str, Any]:
+    """1단계 추가 신호(업종분류·외국인/기관 순매수·공매도 잔고·외국인 보유율 + DART 분기 재무)를 월말마다 백그라운드로 받아 둡니다.
+    서버 시작 시 factors 월말 수집이 끝나면 자동으로 시작하므로 보통 호출할 필요가 없습니다. 진행률은 signals_cache_status."""
+    return signals.prefetch(max(2.0, min(float(years), 20.0)))
+
+
+@mcp.tool()
+def signals_cache_status() -> dict[str, Any]:
+    """추가 신호 캐시 상태: 월말 수·커버리지(업종/수급/공매도/외국인), DART 분기 수·회사 수·키 설정 여부, 등록된 팩터 이름과 그룹.
+    backtest_factors / screen_factors 의 factors_spec 에 이 팩터 이름(epm, sales_g, opm_chg, agr, roe_ttm, op_yield, sec_margin,
+    sec_mom, rs3, flow20, flow60, frgn_chg, short_bal, short_chg)과 그룹(earnings, quality2, sector, flow, shortint)을 쓸 수 있습니다."""
+    return signals.cache_status()
 
 
 @mcp.tool()
@@ -806,6 +823,7 @@ def screen_factors(factors_spec: str = "value,quality,lowvol,mom", min_cap_eok: 
     팩터별 순위, PBR·PER·배당·ROE·12-1모멘텀·1개월수익률·12개월변동성·52주고가·회전율을 함께 돌려줍니다.
     최근 거래일 시세를 KRX 에서 3회 받아 하루 캐시합니다(약 5~10초). 월말 캐시 13개가 없으면 status="preparing".
     사실 데이터 집계이며 매매 권유가 아닙니다 — 백테스트에서 기준을 통과한 조합만 쓰세요."""
+    signals.refresh_recent_async()
     return factors.run_screen(factors=factors_spec, min_cap_억=min_cap_eok, top_n=int(top_n),
                               exclude_managed=bool(exclude_managed), min_price=float(min_price))
 

@@ -123,6 +123,25 @@ PER·PBR·EPS·BPS·DIV) + KOSPI 지수 일별(거래일 달력, 연 1회). 10�
 
 환경 변수: `FACTOR_YEARS`(기본 10), `FACTOR_PREFETCH=0` 이면 자동 수집 끔.
 
+### 1단계 추가 신호 — `signals.py` (2026-11-08 추가)
+
+`factors` 레지스트리에 팩터로 등록되므로 `backtest_factors`/`screen_factors` 의 `factors_spec` 에 이름을 그대로 씁니다(예: `"earnings,flow,value"`, `hold_months=3`).
+
+| 신호 | 정의 | 출처 |
+|---|---|---|
+| `epm` | (당분기 3개월 영업이익 − 전년 동분기) / 시총 — 이익 모멘텀 | DART 분기 재무(공시 접수일 이후 반영) |
+| `sales_g`, `opm_chg` | 매출 3개월 YoY, 영업이익률 YoY 변화(%p) | DART |
+| `agr`(낮을수록), `roe_ttm`, `op_yield` | 자산증가율, 4분기 순이익/자본, 4분기 영업이익/시총 | DART |
+| `sec_margin` | 업종 내 opm_chg 중앙값(산업 마진 추세) | DART + KRX 업종분류 |
+| `sec_mom`, `rs3` | 업종 12-1 모멘텀, 종목−업종 3개월 상대강도 | KRX 업종별 분류현황(날짜별) |
+| `flow20`, `flow60`, `frgn_chg` | (외국인+기관) 20거래일 순매수/시총, 3개월 합, 외국인 지분율 3개월 변화 | KRX 투자자별 순매수·외국인 보유 |
+| `short_bal`, `short_chg`(둘 다 낮을수록) | 공매도 잔고 비중, 3개월 변화 | KRX 공매도 잔고(2016-06~) |
+| 그룹 | `earnings`=[epm,sales_g,opm_chg] `quality2`=[roe_ttm,agr] `sector`=[sec_mom,rs3,sec_margin] `flow`=[flow20,flow60,frgn_chg] `shortint`=[short_bal,short_chg] | |
+
+도구: `signals_prefetch(years)`, `signals_cache_status()`. 수집은 factors 월말 수집이 끝난 뒤 자동 시작(월말당 KRX 9회 ≈ 10년 40분, DART 분기당 약 30회 ≈ 15분).
+
+환경 변수: `DART_API_KEY`(OpenDART 인증키 — 없으면 DART 신호는 NaN, 나머지는 정상), `SIGNALS_PREFETCH=0` 자동 수집 끔, `SIGNALS_YEARS`(기본 10).
+
 ## 알아둘 것
 
 ### KRX 계정 (`KRX_ID` / `KRX_PW`)
