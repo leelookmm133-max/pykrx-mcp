@@ -274,6 +274,13 @@ def load_corp_map() -> dict[str, str]:
     if not content:
         return {}
     out: dict[str, str] = {}
+    if not content[:2] == b"PK":            # zip 이 아니면 DART 가 오류 본문(XML/JSON)을 보낸 것 — 키 오류 등
+        snippet = content[:300].decode("utf-8", "ignore")
+        m = re.search(r"<status>(\d+)</status>.*?<message>(.*?)</message>", snippet, re.S)
+        msg = f"status {m.group(1)}: {m.group(2)}" if m else snippet.strip()
+        _state["last_error"] = f"corpCode.xml 응답이 zip 이 아님 → {msg}"
+        log.warning("DART corpCode 오류: %s", msg)
+        return {}
     try:
         with zipfile.ZipFile(io.BytesIO(content)) as zf:
             name = next((n for n in zf.namelist() if n.lower().endswith(".xml")), None)
@@ -410,10 +417,17 @@ def ensure_dart(dates: list[str]) -> None:
     _state["dart_status"] = "ready"
 
 
+def _col(df: pd.DataFrame, name: str) -> pd.Series:
+    """없는 열은 NaN float Series 로 (실데이터에서 특정 계정이 통째로 빠진 분기 대비)."""
+    if name in df.columns:
+        return pd.to_numeric(df[name], errors="coerce").astype(float)
+    return pd.Series(np.nan, index=df.index, dtype=float)
+
+
 def quarter_table() -> dict[str, pd.DataFrame]:
     """캐시된 분기 주요계정 → 분기별 3개월 손익·기말 재무상태 표(index=ticker).
     열: rcept, sales3, sales3_py, op3, op3_py, ni3, ni3_py, assets, assets_py, equity, equity_py
-    Q1~Q3: 3개월 금액은 thstrm_amount(없으면 누적 차감). Q4: 사업보고서 연간 − 3분기 누적."""
+    Q1~Q3: 3개월 금액은 thstrm_amount(누적만 있는 회사는 직전 분기 누적을 빼서). Q4: 사업보고서 연간 − 3분기 누적."""
     with _lock:
         raw = {k: v for k, v in _dart_raw.items()}
     keys = sorted(raw)
@@ -424,52 +438,39 @@ def quarter_table() -> dict[str, pd.DataFrame]:
             continue
         y, q = int(k[:4]), k[4:]
         t = pd.DataFrame(index=df.index)
-        t["rcept"] = df.get("rcept")
+        t["rcept"] = df["rcept"].astype(str) if "rcept" in df.columns else "99999999"
         for acc in ("assets", "equity"):
-            t[acc] = df.get(f"{acc}_cur")
-            t[f"{acc}_py"] = df.get(f"{acc}_py")
+            t[acc] = _col(df, f"{acc}_cur")
+            t[f"{acc}_py"] = _col(df, f"{acc}_py")
         if q in ("Q1", "Q2", "Q3"):
+            prev = raw.get(f"{y}{'Q1' if q == 'Q2' else 'Q2'}") if q != "Q1" else None
             for acc in ("sales", "op", "ni"):
-                cur3 = df.get(f"{acc}_cur")
-                cur_add = df.get(f"{acc}_cur_add")
-                py3 = df.get(f"{acc}_py")
-                py_add = df.get(f"{acc}_py_add")
+                cur3, cur_add = _col(df, f"{acc}_cur"), _col(df, f"{acc}_cur_add")
+                py3, py_add = _col(df, f"{acc}_py"), _col(df, f"{acc}_py_add")
                 if q == "Q1":
                     t[f"{acc}3"], t[f"{acc}3_py"] = cur3, py3
                 else:
-                    # 누적만 있는 회사: 직전 분기 누적을 빼서 3개월로
-                    prev = raw.get(f"{y}{'Q1' if q == 'Q2' else 'Q2'}")
-                    if cur_add is not None and cur3 is not None:
-                        has_add = cur_add.notna() & cur3.notna() & (cur_add != cur3)
-                    else:
-                        has_add = pd.Series(False, index=df.index)
-                    c3 = cur3.copy() if cur3 is not None else pd.Series(np.nan, index=df.index)
-                    p3 = py3.copy() if py3 is not None else pd.Series(np.nan, index=df.index)
-                    if prev is not None and not prev.empty and cur_add is not None:
-                        pc = prev.get(f"{acc}_cur_add")
-                        pp = prev.get(f"{acc}_py_add")
-                        if pc is not None:
-                            derived = cur_add - pc.reindex(df.index)
-                            c3 = c3.where(has_add, derived.where(derived.notna(), c3))
-                        if pp is not None and py_add is not None:
-                            derived_p = py_add - pp.reindex(df.index)
-                            p3 = p3.where(has_add, derived_p.where(derived_p.notna(), p3))
+                    has_add = cur_add.notna() & cur3.notna() & (cur_add != cur3)   # 3개월·누적이 따로 있으면 3개월 값 그대로
+                    c3, p3 = cur3.copy(), py3.copy()
+                    if prev is not None and not prev.empty:
+                        pc = _col(prev, f"{acc}_cur_add").reindex(df.index)
+                        pp = _col(prev, f"{acc}_py_add").reindex(df.index)
+                        derived = cur_add - pc
+                        derived_p = py_add - pp
+                        c3 = c3.where(has_add, derived.where(derived.notna(), c3))
+                        p3 = p3.where(has_add, derived_p.where(derived_p.notna(), p3))
                     t[f"{acc}3"], t[f"{acc}3_py"] = c3, p3
-            if q == "Q3":
-                for acc in ("sales", "op", "ni"):
-                    t[f"{acc}_cum"] = df.get(f"{acc}_cur_add")
-                    t[f"{acc}_cum_py"] = df.get(f"{acc}_py_add")
+                if q == "Q3":
+                    t[f"{acc}_cum"], t[f"{acc}_cum_py"] = cur_add, py_add
         else:  # Q4 = 연간 − 3분기 누적
             q3 = out.get(f"{y}Q3")
             for acc in ("sales", "op", "ni"):
-                yr = df.get(f"{acc}_cur")
-                yr_py = df.get(f"{acc}_py")
+                yr, yr_py = _col(df, f"{acc}_cur"), _col(df, f"{acc}_py")
                 if q3 is not None and f"{acc}_cum" in q3.columns:
                     t[f"{acc}3"] = yr - q3[f"{acc}_cum"].reindex(df.index)
                     t[f"{acc}3_py"] = yr_py - q3[f"{acc}_cum_py"].reindex(df.index)
                 else:
-                    t[f"{acc}3"] = np.nan
-                    t[f"{acc}3_py"] = np.nan
+                    t[f"{acc}3"], t[f"{acc}3_py"] = np.nan, np.nan
                 t[f"{acc}_y"] = yr
         out[k] = t
     return out
@@ -546,11 +547,22 @@ def _get_sig(P: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     return _sig_cache[key]
 
 
+_dart_compute_error: dict[str, Any] = {"error": None}
+
+
 def _get_dart(P: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     key = id(P["close"])
     if key not in _dart_cache:
         _dart_cache.clear()
-        _dart_cache[key] = dart_panels(list(P["close"].index), list(P["close"].columns))
+        try:
+            _dart_cache[key] = dart_panels(list(P["close"].index), list(P["close"].columns))
+            _dart_compute_error["error"] = None
+        except Exception as e:  # noqa: BLE001
+            _dart_compute_error["error"] = f"{type(e).__name__}: {e}"
+            log.exception("DART 패널 계산 실패")
+            idx, cols = P["close"].index, P["close"].columns
+            _dart_cache[key] = {k: pd.DataFrame(np.nan, index=idx, columns=cols)
+                                for k in ("op3", "op3_py", "sales3", "sales3_py", "ni_ttm", "op_ttm", "assets", "assets_py", "equity")}
     return _dart_cache[key]
 
 
@@ -739,8 +751,15 @@ def prefetch(years: float | None = None) -> dict[str, Any]:
             n = int(round(years * 12)) + factors.WARMUP_MONTHS
             dates = dates[-n:]
             # DART 먼저(빠르고 다른 호스트) → KRX 신호
+            def _dart_job():
+                try:
+                    ensure_dart(dates)
+                except Exception as e:  # noqa: BLE001
+                    _state["dart_status"] = f"failed: {type(e).__name__}: {e}"
+                    _state["last_error"] = f"DART: {type(e).__name__}: {e}"
+                    log.exception("DART 수집 실패")
             if DART_KEY:
-                t = threading.Thread(target=ensure_dart, args=(dates,), name="signals-dart", daemon=True)
+                t = threading.Thread(target=_dart_job, name="signals-dart", daemon=True)
                 t.start()
             else:
                 t = None
@@ -807,10 +826,11 @@ def cache_status() -> dict[str, Any]:
                              "short": int(np.mean([m["short_n"] for m in metas])) if metas else 0,
                              "frgn_hold": int(np.mean([m["hold_n"] for m in metas])) if metas else 0},
             "sectors_known": len(_sector_code),
-            "dart": {"status": st.get("dart_status"), "key_set": bool(DART_KEY), "quarters": len(dart_keys),
+            "dart": {"status": st.get("dart_status"), "key_set": bool(DART_KEY), "key_len": len(DART_KEY), "quarters": len(dart_keys),
                      "first": dart_keys[0] if dart_keys else None, "last": dart_keys[-1] if dart_keys else None,
                      "companies_per_quarter_avg": int(np.mean([v for v in dart_n.values() if v])) if any(dart_n.values()) else 0,
-                     "corp_map": len(_corp_map), "calls_done": st.get("dart_done"), "calls_target": st.get("dart_target")},
+                     "corp_map": len(_corp_map), "calls_done": st.get("dart_done"), "calls_target": st.get("dart_target"),
+                     "panel_compute_error": _dart_compute_error["error"], "last_error": st.get("last_error")},
             "prefetch": st, "process_rss_mb": _rss_mb(),
             "factors_registered": [n for n in factors.ATOMIC_FACTORS if n in factors.EXTRA_FACTORS],
             "groups": {k: v for k, v in factors.GROUP_FACTORS.items() if k in ("earnings", "quality2", "sector", "flow", "shortint")},

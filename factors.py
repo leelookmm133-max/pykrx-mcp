@@ -776,7 +776,9 @@ def _nanmean_stack(frames: list[pd.DataFrame], min_frac: float = 0.67) -> pd.Dat
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)      # 전부 NaN 인 칸(준비기간 등)의 'Mean of empty slice'
         avg = np.nanmean(stacked, axis=0)
-    avg[cnt < max(1, math.ceil(len(frames) * min_frac))] = np.nan
+    # 팩터 3개면 2개, 4개면 3개, 5개면 3개 이상 있어야 복합점수 계산(반올림; 이전 ceil 은 3개 중 3개를 요구했음)
+    need = max(1, int(math.floor(len(frames) * min_frac + 0.5)))
+    avg[cnt < need] = np.nan
     return pd.DataFrame(avg, index=frames[0].index, columns=frames[0].columns)
 
 
