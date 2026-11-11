@@ -769,7 +769,8 @@ def factor_month_debug(ymd: str = "", n: int = 20) -> dict[str, Any]:
 def backtest_factors(factors_spec: str = "value,quality,lowvol,mom", min_cap_eok: float = 1000, years: float = 10,
                      top_pct: float = 10, top_n: int = 0, hold_months: int = 1, exclude_managed: bool = True,
                      min_price: float = 1000, include_single_factor_table: bool = True,
-                     max_months_listed: int = 130) -> dict[str, Any]:
+                     max_months_listed: int = 130, cost_pct: float = 0.5, delist_return_pct: float = -50.0,
+                     exclude_suspended: bool = True) -> dict[str, Any]:
     """학계식 팩터 백테스트: 매월 말 유니버스(보통주, 시총 min_cap_eok억↑) 전종목을 팩터 백분위 순위로 점수화해
     상위 top_pct%(또는 top_n 종목)를 동일가중 매수, hold_months 개월 보유(월말 리밸런싱), 다음 달 수익률을
     유니버스 동일가중 평균·종목별 시장 지수와 비교합니다. years 년(기본 10년 = 120개월).
@@ -779,15 +780,21 @@ def backtest_factors(factors_spec: str = "value,quality,lowvol,mom", min_cap_eok
       lowvol(12개월 저변동성) high52(52주고가 근접) size(소형주) lowturn(저회전율). 복합점수 = 팩터 순위 평균.
 
     결과: criteria_academic(사전 기준 5개 통과/미달: 월평균 초과 +0.3%p↑, t≥2, 월 적중률 55%↑, 전·후반 모두 플러스,
-    10분위 단조성), portfolio(월평균·초과·t·적중률·CAGR·MDD, 지수 대비), ic(순위상관), deciles(10분위),
-    top30_fixed(상위 30종목 고정 버전), by_year, monthly, single_factors(팩터별 단독 성과표 — 어떤 팩터가 한국에서
-    먹히는지), data_quality. 캐시가 아직 없으면 status="preparing" 과 진행률을 돌려줍니다.
+    10분위 단조성; ⑥ 비용 후 초과수익은 참고), portfolio(월평균·초과·t·적중률·CAGR·MDD, 지수 대비, 회전율, cost=비용 후 지표),
+    ic(순위상관), deciles(10분위), top30_fixed(상위 30종목 고정 버전), by_year, monthly, single_factors(팩터별 단독 성과표),
+    data_quality. 캐시가 아직 없으면 status="preparing" 과 진행률을 돌려줍니다.
+
+    v1.4 계산 규칙: cost_pct = 왕복 거래비용(%)으로 월 교체율에 곱해 비용 후 지표 산출(기본 0.5). delist_return_pct = 다음 달
+    스냅샷에서 사라진 종목(상장폐지·합병)의 그 달 수익률(기본 -50; 민감도는 0/-50/-90 비교). exclude_suspended = 월 거래량 0
+    (거래정지) 종목 편입 제외. hold_months>1 이면 t 는 Newey-West 보정값(excess_t_stat_plain 이 단순 t).
     결과는 과거 통계이며 매매 권유가 아닙니다."""
     signals.refresh_recent_async()
     return factors.run_backtest(factors=factors_spec, min_cap_억=min_cap_eok, years=float(years), top_pct=float(top_pct),
                                 top_n=int(top_n), hold_months=int(hold_months), exclude_managed=bool(exclude_managed),
                                 min_price=float(min_price), include_single_factor_table=bool(include_single_factor_table),
-                                max_months_listed=int(max_months_listed))
+                                max_months_listed=int(max_months_listed), cost_pct=float(cost_pct),
+                                delist_return_pct=(None if delist_return_pct is None else float(delist_return_pct)),
+                                exclude_suspended=bool(exclude_suspended))
 
 
 @mcp.tool()
@@ -795,6 +802,18 @@ def signals_prefetch(years: float = 10) -> dict[str, Any]:
     """1단계 추가 신호(업종분류·외국인/기관 순매수·공매도 잔고·외국인 보유율 + DART 분기 재무)를 월말마다 백그라운드로 받아 둡니다.
     서버 시작 시 factors 월말 수집이 끝나면 자동으로 시작하므로 보통 호출할 필요가 없습니다. 진행률은 signals_cache_status."""
     return signals.prefetch(max(2.0, min(float(years), 20.0)))
+
+
+@mcp.tool()
+def cache_persist_status() -> dict[str, Any]:
+    """디스크 캐시 영속화 상태. Railway 볼륨을 서비스에 붙이면(RAILWAY_VOLUME_MOUNT_PATH 자동 설정, 또는 CACHE_DIR 지정)
+    일별(screener)·월말(factors)·신호/DART(signals) 캐시를 pickle 로 저장해 재시작 때 KRX 재수집 없이 몇 초 만에 복구합니다.
+    enabled=false 면 저장소가 없어 기존처럼 매번 받습니다."""
+    import cachestore
+    return {"store": cachestore.status(), "screener": cachestore.status("screener"), "factors": cachestore.status("factors"),
+            "signals": cachestore.status("signals"),
+            "env": {"CACHE_DIR": os.environ.get("CACHE_DIR"), "RAILWAY_VOLUME_MOUNT_PATH": os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")},
+            "how_to": "Railway 캔버스에서 서비스 우클릭 → Add Volume(마운트 경로 예: /data) → 재배포. 첫 수집이 끝나면 자동 저장되고 그다음 재시작부터 복구됩니다."}
 
 
 @mcp.tool()

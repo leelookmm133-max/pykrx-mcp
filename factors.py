@@ -51,6 +51,11 @@ import pandas as pd
 import screener
 from screener import _intern, _malloc_trim, _retry, _rss_mb, FETCH_DELAY, KST
 
+try:
+    import cachestore            # 같은 폴더. Railway 볼륨(CACHE_DIR/RAILWAY_VOLUME_MOUNT_PATH)에 캐시 저장·복구
+except Exception:  # noqa: BLE001
+    cachestore = None
+
 log = logging.getLogger("factors")
 
 try:  # pykrx 내부 KRX 엔드포인트 (pykrx 1.2.x). 없으면 공개 API 로 폴백.
@@ -541,9 +546,50 @@ def _fetch_change_verified(prev_ymd: str | None, ymd: str, prev_df: pd.DataFrame
     return best[1], best[2], best[3]
 
 
+CACHE_NAME = "factors"
+
+
+def save_cache() -> bool:
+    """월말 스냅샷·메타·달력을 디스크에 저장(저장소가 있을 때만)."""
+    if cachestore is None:
+        return False
+    with _lock:
+        payload = {"version": 1, "snaps": dict(_snaps), "meta": dict(_snap_meta), "month_end": dict(_month_end),
+                   "holidays": set(_holidays), "calendar": dict(_calendar), "chg_mode": dict(_chg_mode),
+                   "names_latest": _names_latest, "saved_at": _today().strftime("%Y-%m-%d %H:%M:%S")}
+    return cachestore.save(CACHE_NAME, payload)
+
+
+def load_cache() -> int:
+    """디스크 캐시를 메모리로 복구. 복구한 월말 수를 돌려준다(저장소 없으면 0)."""
+    global _names_latest
+    if cachestore is None:
+        return 0
+    obj = cachestore.load(CACHE_NAME)
+    if not obj or not isinstance(obj, dict) or "snaps" not in obj:
+        return 0
+    with _lock:
+        for d, df in obj["snaps"].items():
+            if isinstance(df, pd.DataFrame) and list(df.columns) == SNAP_COLS:
+                _snaps[d] = df
+                _snap_meta[d] = obj.get("meta", {}).get(d, {})
+        _month_end.update(obj.get("month_end", {}))
+        _holidays.update(obj.get("holidays", set()))
+        cal = obj.get("calendar") or {}
+        if cal.get("days"):
+            _calendar.update(cal)
+        if obj.get("chg_mode", {}).get("mode"):
+            _chg_mode["mode"] = obj["chg_mode"]["mode"]
+        if obj.get("names_latest"):
+            _names_latest = obj["names_latest"]
+    log.info("factors 캐시 복구: 월말 %d개 (저장 %s)", len(_snaps), obj.get("saved_at"))
+    return len(_snaps)
+
+
 def ensure_months(n_months: int) -> list[str]:
     """최근 n_months 개 월말 스냅샷을 (없으면 받아서) 캐시에 채우고, 날짜 목록(오름차순)을 돌려준다."""
     global _names_latest
+    fetched_new = False
     months = _month_list(n_months)
     # 거래일 달력(KOSPI 지수 일별): 월말 거래일과 '직전 월말 다음 거래일'을 정확히 잡기 위해 먼저 받는다(연 1회 호출).
     y0, m0 = months[0]
@@ -586,7 +632,10 @@ def ensure_months(n_months: int) -> list[str]:
         dates.append(ymd)
         prev_ymd, prev_df = ymd, snap
         _state["done"] = len(dates)
+        fetched_new = True
     dates.sort()
+    if fetched_new:
+        save_cache()
     return dates
 
 
@@ -643,6 +692,7 @@ def cache_status() -> dict[str, Any]:
                              "months_change_empty": sum(1 for m in metas.values() if m.get("chg_empty")),
                              "start_date_mode": _chg_mode["mode"], "last_change_error": dict(_last_change_error)},
            "fundamental_months": fund_ok,
+           "persist": cachestore.status(CACHE_NAME) if cachestore is not None else {"enabled": False},
            "note": "backtest_factors 는 (years×12 + 13)개 월말이 있어야 전 기간을 계산합니다. 부족하면 있는 만큼 계산합니다. "
                    "월별 상세는 factor_month_debug 로 확인합니다."}
     if st["running"] and st["target"]:
@@ -825,6 +875,26 @@ def _tstat(x: pd.Series) -> float | None:
     return round(float(x.mean() / x.std(ddof=1) * math.sqrt(len(x))), 2)
 
 
+def _tstat_nw(x: pd.Series, lags: int = 0) -> float | None:
+    """Newey-West(Bartlett) 표준오차 기반 t. 겹치는 코호트(보유 k개월)의 월간 수익률은 k-1 시차까지 자기상관이 있어
+    단순 t 가 과대평가되므로 lags = k-1 로 보정한다. lags=0 이면 단순 t 와 같다."""
+    arr = x.dropna().to_numpy(dtype=float)
+    n = len(arr)
+    if n < 3:
+        return None
+    m = float(arr.mean())
+    e = arr - m
+    var = float((e * e).mean())
+    L = max(0, min(int(lags), n - 2))
+    for l in range(1, L + 1):
+        w = 1.0 - l / (L + 1.0)
+        var += 2.0 * w * float((e[l:] * e[:-l]).mean())
+    var *= n / (n - 1.0)          # 소표본 보정 — lags=0 이면 단순 t(ddof=1)와 정확히 일치
+    if var <= 0:
+        return None
+    return round(m / math.sqrt(var / n), 2)
+
+
 def _cagr(r: pd.Series) -> float | None:
     r = r.dropna()
     if len(r) == 0:
@@ -832,8 +902,10 @@ def _cagr(r: pd.Series) -> float | None:
     return round((float(np.prod(1 + r.to_numpy())) ** (12 / len(r)) - 1) * 100, 1)
 
 
-def _series_stats(port: pd.Series, uni: pd.Series, idx: pd.Series | None) -> dict[str, Any]:
-    """월간 수익률 시리즈(소수) → 요약. port/uni/idx 는 같은 인덱스(수익률 월)."""
+def _series_stats(port: pd.Series, uni: pd.Series, idx: pd.Series | None, nw_lags: int = 0,
+                  cost: pd.Series | None = None) -> dict[str, Any]:
+    """월간 수익률 시리즈(소수) → 요약. port/uni/idx 는 같은 인덱스(수익률 월).
+    nw_lags: 겹치는 코호트 보정(보유 k개월 → k-1). cost: 월별 비용(소수, 수익률 월 인덱스) → 비용 후 지표도 계산."""
     uni = uni.reindex(port.index)
     ok = port.notna() & uni.notna()
     p, u = port[ok], uni[ok]
@@ -848,7 +920,7 @@ def _series_stats(port: pd.Series, uni: pd.Series, idx: pd.Series | None) -> dic
         "avg_month_pct": round(float(p.mean()) * 100, 2),
         "universe_avg_month_pct": round(float(u.mean()) * 100, 2),
         "excess_vs_universe_pp": round(float(ex.mean()) * 100, 2),
-        "excess_t_stat": _tstat(ex),
+        "excess_t_stat": _tstat_nw(ex, nw_lags),
         "hit_rate_vs_universe_pct": round(float((ex > 0).mean()) * 100, 1),
         "excess_first_half_pp": round(float(ex.iloc[:half].mean()) * 100, 2) if half else None,
         "excess_second_half_pp": round(float(ex.iloc[half:].mean()) * 100, 2) if half else None,
@@ -857,6 +929,9 @@ def _series_stats(port: pd.Series, uni: pd.Series, idx: pd.Series | None) -> dic
         "ann_vol_pct": round(float(p.std(ddof=1)) * math.sqrt(12) * 100, 1) if n > 1 else None,
         "max_drawdown_pct": round(float((cum / cum.cummax() - 1).min()) * 100, 1),
     }
+    if nw_lags > 0:
+        out["excess_t_stat_plain"] = _tstat(ex)
+        out["t_stat_note"] = f"excess_t_stat 은 Newey-West(시차 {nw_lags}) 보정값, _plain 은 단순 t"
     if idx is not None:
         i = idx.reindex(p.index)
         oki = i.notna()
@@ -864,9 +939,22 @@ def _series_stats(port: pd.Series, uni: pd.Series, idx: pd.Series | None) -> dic
             exi = p[oki] - i[oki]
             out["index_avg_month_pct"] = round(float(i[oki].mean()) * 100, 2)
             out["excess_vs_index_pp"] = round(float(exi.mean()) * 100, 2)
-            out["excess_vs_index_t_stat"] = _tstat(exi)
+            out["excess_vs_index_t_stat"] = _tstat_nw(exi, nw_lags)
             out["hit_rate_vs_index_pct"] = round(float((exi > 0).mean()) * 100, 1)
             out["index_cagr_pct"] = _cagr(i[oki])
+    if cost is not None:
+        c = cost.reindex(p.index).fillna(0.0)
+        pn = p - c
+        exn = pn - u
+        out["cost"] = {
+            "avg_month_cost_pp": round(float(c.mean()) * 100, 3),
+            "annual_cost_drag_pp": round(float(c.mean()) * 12 * 100, 2),
+            "net_avg_month_pct": round(float(pn.mean()) * 100, 2),
+            "net_excess_vs_universe_pp": round(float(exn.mean()) * 100, 2),
+            "net_excess_t_stat": _tstat_nw(exn, nw_lags),
+            "net_hit_rate_vs_universe_pct": round(float((exn > 0).mean()) * 100, 1),
+            "net_cagr_pct": _cagr(pn),
+        }
     return out
 
 
@@ -890,8 +978,14 @@ def _criteria(st: dict[str, Any], decile_means: list[float | None] | None) -> di
     rows.append({"기준": "⑤ 10분위 단조성(스피어만 ρ, D10>D1)", "값": rho,
                  "기준값": f"ρ ≥ {CRITERIA['mono_rho']} 그리고 D10 > D1", "통과": mono_ok})
     passed = sum(1 for r in rows if r["통과"])
-    return {"rows": rows, "passed": f"{passed}/5",
-            "verdict": "통과(5/5)" if passed == 5 else ("부분 통과" if passed >= 3 else "미달")}
+    out = {"rows": rows, "passed": f"{passed}/5",
+           "verdict": "통과(5/5)" if passed == 5 else ("부분 통과" if passed >= 3 else "미달")}
+    cost = st.get("cost")
+    if cost:
+        net = cost.get("net_excess_vs_universe_pp")
+        out["rows"].append({"기준": "⑥ (참고) 비용 후 초과수익", "값": None if net is None else f"{net:+.2f}%p",
+                            "기준값": "> 0 (판정에는 미포함)", "통과": bool(net is not None and net > 0)})
+    return out
 
 
 # ────────────────────────────────────────────────────────────
@@ -914,12 +1008,48 @@ def _index_monthly(dates: list[str]) -> tuple[pd.Series, pd.Series]:
     return out[0], out[1]
 
 
-def _universe_mask(P: dict[str, pd.DataFrame], min_cap: float, exclude_managed: bool, min_price: float) -> pd.DataFrame:
+def _universe_mask(P: dict[str, pd.DataFrame], min_cap: float, exclude_managed: bool, min_price: float,
+                   exclude_suspended: bool = True) -> pd.DataFrame:
     close, cap = P["close"], P["cap"]
     m = (P["common"] > 0) & close.notna() & (close >= min_price) & cap.notna() & (cap >= min_cap)
     if exclude_managed:
         m &= ~(P["managed"] > 0)
+    if exclude_suspended and "tvol_m" in P:
+        # 그 달 거래량이 0 인 종목(거래정지)은 살 수 없으므로 편입 후보에서 제외.
+        # 등락률 조회가 실패해 월간 거래량이 통째로 없는 달(행의 절반 이상 NaN)에는 적용하지 않는다.
+        tv = P["tvol_m"]
+        row_has = tv.notna().mean(axis=1) > 0.5
+        tradable = (tv > 0) | ~pd.DataFrame(np.repeat(row_has.to_numpy()[:, None], tv.shape[1], axis=1), index=tv.index, columns=tv.columns)
+        m &= tradable
     return m
+
+
+def _apply_delisting(P: dict[str, pd.DataFrame], delist_return_pct: float | None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """다음 달 스냅샷에서 사라진 종목(상장폐지·합병 등)에 delist_return_pct 를 그 달 수익률로 부여.
+    반환: (보정된 월간 수익률 패널, 사라진 종목 표시 패널[행=마지막 관측 월])."""
+    close, ret = P["close"], P["ret"]
+    present = close.notna()
+    nxt = present.shift(-1, fill_value=False)
+    vanished = present & ~nxt
+    vanished.iloc[-1, :] = False                      # 마지막 월말은 다음 달이 없어 판단 불가
+    ret_adj = ret.copy()
+    if delist_return_pct is not None:
+        hit = vanished.shift(1, fill_value=False)      # 사라진 종목의 '그 다음 달' 칸
+        ret_adj = ret_adj.where(~hit, float(delist_return_pct) / 100.0)
+    return ret_adj, vanished
+
+
+def _turnover(sel: pd.DataFrame, k: int) -> pd.Series:
+    """형성월별 편도 교체 비율(포트폴리오 전체 대비). k>1 이면 그 달에 교체되는 코호트(1/k)만큼으로 환산."""
+    s = sel.to_numpy(dtype=bool)
+    n_t = s.sum(axis=1)
+    out = np.full(len(s), np.nan)
+    for i in range(k, len(s)):
+        if n_t[i] == 0 or n_t[i - k] == 0:
+            continue
+        overlap = int((s[i] & s[i - k]).sum())
+        out[i] = (1.0 - overlap / n_t[i]) / k
+    return pd.Series(out, index=sel.index)
 
 
 def _to_return_month(s: pd.Series, dates: list[str], j: int) -> pd.Series:
@@ -1029,9 +1159,15 @@ def _data_quality(dates: list[str]) -> dict[str, Any]:
             "note": "krx_adjusted: KRX 수정주가 수익률 전부 사용. hybrid: 기준가가 맞는 종목만 KRX, 나머지 종가 기반. close_fallback: 등락률 조회 실패."}
 
 
+DEFAULT_COST_PCT = 0.5          # 왕복 거래비용(%): 수수료·거래세·호가 영향 합산 가정
+DEFAULT_DELIST_PCT = -50.0      # 다음 달 스냅샷에서 사라진 종목(상장폐지·합병)에 부여하는 그 달 수익률(%)
+
+
 def run_backtest(factors: Any = DEFAULT_FACTORS, min_cap_억: float = 1000, years: float = 10, top_pct: float = 10,
                  top_n: int = 0, hold_months: int = 1, exclude_managed: bool = True, min_price: float = 1000,
-                 include_single_factor_table: bool = True, max_months_listed: int = 130) -> dict[str, Any]:
+                 include_single_factor_table: bool = True, max_months_listed: int = 130,
+                 cost_pct: float = DEFAULT_COST_PCT, delist_return_pct: float | None = DEFAULT_DELIST_PCT,
+                 exclude_suspended: bool = True) -> dict[str, Any]:
     t0 = time.time()
     try:
         names = _parse_factors(factors)
@@ -1059,13 +1195,14 @@ def run_backtest(factors: Any = DEFAULT_FACTORS, min_cap_억: float = 1000, year
 
     P = _panels(dates)
     min_cap = float(min_cap_억) * 1e8
-    mask = _universe_mask(P, min_cap, exclude_managed, float(min_price))
-    ret = P["ret"]
+    mask = _universe_mask(P, min_cap, exclude_managed, float(min_price), exclude_suspended)
+    ret, vanished = _apply_delisting(P, delist_return_pct)     # 사라진 종목 → 그 달 수익률 delist_return_pct
     fwd = ret.shift(-1)                      # 형성월 t → 다음 한 달 수익률
-    mask_f = mask & fwd.notna()              # 유니버스: 다음 달 수익률이 있는 종목
+    mask_f = mask & fwd.notna()              # 유니버스: 다음 달 수익률이 있는 종목(상폐 규칙 적용분 포함)
     row_ok = np.zeros(len(dates), dtype=bool)
     row_ok[WARMUP_MONTHS - 1:-1] = True      # 형성 가능 월: 준비기간 이후 ~ 마지막 바로 앞
     mask_f.loc[~row_ok, :] = False
+    van_uni = (vanished & mask_f).sum(axis=1)     # 형성월별 유니버스 내 '다음 달 사라진' 종목 수
 
     F = raw_factors(P)
     kospi_m, kosdaq_m = _index_monthly(dates)
@@ -1100,7 +1237,12 @@ def run_backtest(factors: Any = DEFAULT_FACTORS, min_cap_억: float = 1000, year
         top_rule = f"복합점수 상위 {float(top_pct):g}%"
     n_sel = sel.sum(axis=1)
     port, port_idx = _port_series(sel, k)
-    st = _series_stats(port, uni_series, port_idx)
+    turn = _turnover(sel, k)                                          # 형성월 기준 편도 교체율
+    cost_series = _to_return_month(turn * (float(cost_pct) / 100.0), dates, 1)   # 교체분에 왕복 비용
+    nw = k - 1
+    st = _series_stats(port, uni_series, port_idx, nw_lags=nw, cost=cost_series)
+    st["avg_monthly_turnover_pct"] = round(float(turn.dropna().mean()) * 100, 1) if turn.notna().any() else None
+    st["delisted_in_portfolio_total"] = int((vanished & sel).to_numpy().sum())
     deciles = _decile_table(comp, fwd, uni_ret, mask_f)
     crit = _criteria(st, [d.get("avg_month_pct") for d in deciles["rows"]] if deciles["rows"] else None)
     ic_stats = _ic_summary(_ic_series(comp, fwd, mask_f))
@@ -1128,7 +1270,9 @@ def run_backtest(factors: Any = DEFAULT_FACTORS, min_cap_억: float = 1000, year
     # ── 참고: 상위 30종목 고정(개인 투자자 규모)
     sel30 = ((-comp).rank(axis=1, method="first") <= 30) & mask_f
     p30, i30 = _port_series(sel30, k)
-    st30 = _series_stats(p30, uni_series, i30)
+    turn30 = _turnover(sel30, k)
+    st30 = _series_stats(p30, uni_series, i30, nw_lags=nw, cost=_to_return_month(turn30 * (float(cost_pct) / 100.0), dates, 1))
+    st30["avg_monthly_turnover_pct"] = round(float(turn30.dropna().mean()) * 100, 1) if turn30.notna().any() else None
 
     out: dict[str, Any] = {
         "ok": True,
@@ -1137,11 +1281,18 @@ def run_backtest(factors: Any = DEFAULT_FACTORS, min_cap_억: float = 1000, year
                    "팩터": {n: (" + ".join(GROUP_FACTORS[n]) + " 순위 평균" if n in GROUP_FACTORS else ATOMIC_FACTORS[n][1]) for n in names},
                    "복합점수": "각 팩터 백분위 순위의 평균(팩터 2/3 이상 있는 종목만) → 다시 백분위(100 = 최상위)",
                    "상위_규칙": top_rule, "보유_개월": k, "리밸런싱": "월말",
-                   "유니버스": f"보통주(우선주·스팩·코넥스 제외){', 관리·환기종목 제외' if exclude_managed else ''}, "
-                               f"시총 {float(min_cap_억):g}억 이상, 주가 {float(min_price):g}원 이상, 다음 달 가격 존재"},
+                   "유니버스": f"보통주(우선주·스팩·코넥스 제외){', 관리·환기종목 제외' if exclude_managed else ''}"
+                               f"{', 거래정지(월 거래량 0) 제외' if exclude_suspended else ''}, "
+                               f"시총 {float(min_cap_억):g}억 이상, 주가 {float(min_price):g}원 이상",
+                   "상장폐지_규칙": (f"다음 달 스냅샷에서 사라진 종목은 그 달 수익률 {float(delist_return_pct):g}% 로 간주(유니버스·포트 동일)"
+                                   if delist_return_pct is not None else "미적용(사라진 종목 제외)"),
+                   "거래비용": f"왕복 {float(cost_pct):g}% × 월 교체율 → cost 항목(비용 후 지표). 판정 기준 ①~⑤는 비용 전",
+                   "t_통계량": f"Newey-West 시차 {nw}" if nw > 0 else "단순"},
         "period": {"formation_from": dates[WARMUP_MONTHS - 1], "formation_to": dates[-2], "return_months": st.get("months"),
                    "snapshots": len(dates), "data_from": dates[0], "data_to": dates[-1],
-                   "avg_universe_size": int(round(float(uni_n[row_ok].mean()))) if bool(row_ok.any()) else None},
+                   "avg_universe_size": int(round(float(uni_n[row_ok].mean()))) if bool(row_ok.any()) else None,
+                   "delisted_in_universe_total": int(van_uni[row_ok].sum()),
+                   "delisted_in_universe_per_month": round(float(van_uni[row_ok].mean()), 2) if bool(row_ok.any()) else None},
         "criteria_academic": crit,
         "portfolio": st,
         "ic": ic_stats,
@@ -1156,10 +1307,11 @@ def run_backtest(factors: Any = DEFAULT_FACTORS, min_cap_억: float = 1000, year
     out["data_quality"] = _data_quality(dates)
     out["caveats"] = [
         "월간 수익률은 KRX 전종목등락률(수정주가)로 액면분할·무상증자 등을 보정. 기준가 검증에 실패한 달은 종가 기반(상장주식수 변동 보정)으로 대체 — data_quality 참고",
-        "다음 달 가격이 없는 종목(상장폐지·거래정지)은 그 달 유니버스·포트폴리오에서 제외 → 상장폐지 손실 미반영(약간의 상향 편향, 유니버스에도 동일 적용)",
+        "다음 달 스냅샷에서 사라진 종목(상장폐지·합병·거래정지 후 폐지)은 그 달 수익률을 delist_return_pct 로 간주(사유 구분 불가 — 합병은 손실이 아닐 수 있고 부실 폐지는 더 클 수 있음). 민감도는 0 / -50 / -90 으로 비교할 것",
         "PER·PBR·EPS·BPS·배당은 KRX 가 해당 월말에 공표한 값(최근 사업보고서 기준) → 미래 정보 없음. 적자·미공표 EPS 는 0 으로 들어옴",
         "저변동성은 월간 수익률 12개 기준(학계는 일간 기준도 사용). 회전율은 월간 거래대금/시총",
-        "월말 종가 매수·다음 월말 종가 매도, 동일가중, 거래비용·호가·세금 미반영(상위 10% ≈ 80~150종목 보유 가정; top30_fixed 는 30종목)",
+        "월말 종가 매수·다음 월말 종가 매도, 동일가중. 비용은 '왕복 cost_pct × 월 교체율'로 근사(호가 영향·세금 변동 미반영). 수익률은 배당 제외(지수도 동일)",
+        "보유기간이 1개월을 넘으면 월간 수익률이 겹쳐 자기상관이 생기므로 t 는 Newey-West 보정값",
         "표본이 10년이어도 시장 국면은 몇 개뿐 → t-통계량과 전·후반 일관성을 함께 볼 것",
     ]
     out["elapsed_sec"] = round(time.time() - t0, 1)
@@ -1305,6 +1457,12 @@ REGISTRATION: dict[str, Any] = {
                             "cagr_pct": 9.0, "universe_cagr_pct": 1.4, "index_cagr_pct": 9.7, "max_drawdown_pct": -47.9,
                             "criteria_passed": "3/5 (①④⑤ 통과, ② t 1.64·③ 적중률 51.7% 미달 — 상위 10% 기준)"},
     "in_sample_window": ("20161031", "20260930"),   # 재현 검사용 형성월 범위
+    "amendments": [
+        "2026-11-11 (v1.4, 계산 방법만 개정 — 종목 선정 규칙은 그대로): ① 다음 달 사라진 종목(상장폐지·합병) 수익률 −50% 간주, "
+        "② 월 거래량 0(거래정지) 종목 편입 제외, ③ 왕복 비용 0.5% × 월 교체율(12개월 보유 → 월 약 0.04%p)을 뺀 비용 후 지표 병기, "
+        "④ 겹치는 코호트 보정 Newey-West t(시차 11). 등록 참고치(+0.61%p·t 1.77)는 구방법 값이며, 새 방법의 기준값은 "
+        "in_sample_reproduction 에 매번 재계산해 표시. 판정 규칙(월평균 초과 +0.3%p·적중률 55%)은 비용 전 수치로 유지",
+    ],
 }
 
 
@@ -1345,7 +1503,7 @@ def _overlap_port(sel: pd.DataFrame, ret: pd.DataFrame, mask: pd.DataFrame, date
     return rows
 
 
-def _rows_summary(rows: list[list[Any]]) -> dict[str, Any]:
+def _rows_summary(rows: list[list[Any]], nw_lags: int = 0, month_cost: float = 0.0) -> dict[str, Any]:
     if not rows:
         return {"months": 0}
     port = pd.Series([r[2] for r in rows], dtype=float)
@@ -1354,13 +1512,18 @@ def _rows_summary(rows: list[list[Any]]) -> dict[str, Any]:
     ex = port - uni
     out = {"months": int(len(rows)), "avg_month_pct": round(float(port.mean()) * 100, 2),
            "universe_avg_month_pct": round(float(uni.mean()) * 100, 2),
-           "excess_vs_universe_pp": round(float(ex.mean()) * 100, 2), "excess_t_stat": _tstat(ex),
+           "excess_vs_universe_pp": round(float(ex.mean()) * 100, 2), "excess_t_stat": _tstat_nw(ex, nw_lags),
+           "excess_t_stat_plain": _tstat(ex),
            "hit_rate_vs_universe_pct": round(float((ex > 0).mean()) * 100, 1),
            "cum_port_pct": round((float(np.prod(1 + port)) - 1) * 100, 1),
            "cum_universe_pct": round((float(np.prod(1 + uni)) - 1) * 100, 1)}
     if idx.notna().any():
         out["cum_index_pct"] = round((float(np.prod(1 + idx.dropna())) - 1) * 100, 1)
         out["excess_vs_index_pp"] = round(float((port - idx).dropna().mean()) * 100, 2)
+    if month_cost:
+        pn = port - month_cost
+        out["cost"] = {"month_cost_pp": round(month_cost * 100, 3), "net_excess_vs_universe_pp": round(float((pn - uni).mean()) * 100, 2),
+                       "net_cum_port_pct": round((float(np.prod(1 + pn)) - 1) * 100, 1)}
     return out
 
 
@@ -1386,21 +1549,22 @@ def run_paper_test(show_all_cohorts: bool = False) -> dict[str, Any]:
     if len(dates) < 2:
         return {"ok": False, "error": "월말 데이터가 없습니다. factor_cache_status 확인.", "registration": reg}
     P = _panels(dates)
-    mask = _universe_mask(P, float(prm["min_cap_eok"]) * 1e8, bool(prm["exclude_managed"]), float(prm["min_price"]))
-    ret = P["ret"]
+    mask = _universe_mask(P, float(prm["min_cap_eok"]) * 1e8, bool(prm["exclude_managed"]), float(prm["min_price"]), True)
+    ret, _van = _apply_delisting(P, DEFAULT_DELIST_PCT)
     bm = 1.0 / P["pbr"].where(P["pbr"] > 0)
     order = (-bm.where(mask)).rank(axis=1, method="first")
     sel = (order <= int(prm["top_n"])) & mask
     kospi_m, kosdaq_m = _index_monthly(dates)
     kflag = (P["kosdaq"].ffill().iloc[-1] > 0).to_numpy()      # 종목별 시장 구분(최신 행 기준; 이전·상폐 종목은 마지막 값)
     k = int(prm["hold_months"])
+    month_cost = (DEFAULT_COST_PCT / 100.0) / k                  # 매달 1/k 코호트 교체 → 왕복 비용의 1/k
 
     oos_rows = _overlap_port(sel, ret, mask, dates, k, reg["oos_first_formation"], dates[-1], kflag, kospi_m, kosdaq_m)
-    oos = _rows_summary(oos_rows)
+    oos = _rows_summary(oos_rows, nw_lags=k - 1, month_cost=month_cost)
     f0, f1 = reg["in_sample_window"]
     ins_rows = _overlap_port(sel, ret, mask, dates, k, f0, f1, kflag, kospi_m, kosdaq_m)
     ins_rows = [r for r in ins_rows if r[0] <= "20261030"]            # 표본 내 수익률월은 2026-10 까지
-    ins = _rows_summary(ins_rows)
+    ins = _rows_summary(ins_rows, nw_lags=k - 1, month_cost=month_cost)
 
     # 판정 미리보기(판정월 전에는 '진행 중')
     n = oos["months"]
@@ -1448,7 +1612,9 @@ def run_paper_test(show_all_cohorts: bool = False) -> dict[str, Any]:
         "oos_monthly": [[f"{r[0][:4]}-{r[0][4:6]}", r[1], round(r[2] * 100, 2), round(r[3] * 100, 2),
                          None if (r[4] is None or np.isnan(r[4])) else round(r[4] * 100, 2), round(r[5] * 100, 2)] for r in oos_rows],
         "cohorts": cohorts_out,
-        "in_sample_reproduction": {"note": "현재 캐시로 표본 내 구간을 같은 규칙으로 다시 계산한 값. registration.in_sample_reference 와 거의 같아야 함",
+        "in_sample_reproduction": {"note": "현재 캐시로 표본 내 구간을 현행 방법(v1.4: 상폐 −50%·거래정지 제외·NW t·비용 병기)으로 다시 계산한 값. "
+                                           "registration.in_sample_reference(구방법 +0.61%p·t 1.77)보다 조금 낮게 나오는 것이 정상이며, "
+                                           "배포 간에 이 값이 흔들리면 데이터 이상",
                                    **ins},
         "elapsed_sec": round(time.time() - t0, 1),
         "note": "사전 등록된 규칙을 그대로 적용한 기록입니다. 규칙을 바꾸지 마세요. 과거·현재 통계이며 매매 권유가 아닙니다.",
@@ -1459,5 +1625,9 @@ def _num_or_none(x, nd: int = 2, scale: float = 1.0):
     return None if pd.isna(x) else round(float(x) * scale, nd)
 
 
+try:
+    load_cache()                 # 볼륨이 있으면 지난 월말 스냅샷을 먼저 복구(없는 달만 받게 됨)
+except Exception as _e:  # noqa: BLE001
+    log.warning("factors 캐시 복구 중 오류(무시): %s", _e)
 if os.environ.get("FACTOR_PREFETCH", "1") != "0":
     prefetch()

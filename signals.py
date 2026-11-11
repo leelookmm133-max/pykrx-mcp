@@ -57,7 +57,13 @@ import factors
 import screener
 from screener import FETCH_DELAY, KST, _intern, _malloc_trim, _retry, _rss_mb
 
+try:
+    import cachestore
+except Exception:  # noqa: BLE001
+    cachestore = None
+
 log = logging.getLogger("signals")
+CACHE_NAME = "signals"
 
 DART_KEY = os.environ.get("DART_API_KEY", "").strip()
 DART_BASE = "https://opendart.fss.or.kr/api"
@@ -415,6 +421,8 @@ def ensure_dart(dates: list[str]) -> None:
             _dart_meta[f"{y}{q}"] = {"n": int(len(df)), "fetched_at": _ymd(_today())}
         _malloc_trim()
     _state["dart_status"] = "ready"
+    if todo:
+        save_cache()
 
 
 def _col(df: pd.DataFrame, name: str) -> pd.Series:
@@ -711,6 +719,42 @@ def register_all() -> None:
 # ────────────────────────────────────────────────────────────
 # 수집 오케스트레이션
 # ────────────────────────────────────────────────────────────
+def save_cache() -> bool:
+    if cachestore is None:
+        return False
+    with _lock:
+        payload = {"version": 1, "sig": dict(_sig), "sig_meta": dict(_sig_meta), "sector_code": dict(_sector_code),
+                   "sector_name": dict(_sector_name), "dart_raw": dict(_dart_raw), "dart_meta": dict(_dart_meta),
+                   "corp_map": dict(_corp_map), "saved_at": _today().strftime("%Y-%m-%d %H:%M:%S")}
+    return cachestore.save(CACHE_NAME, payload)
+
+
+def load_cache() -> int:
+    global _corp_map
+    if cachestore is None:
+        return 0
+    obj = cachestore.load(CACHE_NAME)
+    if not obj or not isinstance(obj, dict) or "sig" not in obj:
+        return 0
+    with _lock:
+        for d, df in obj["sig"].items():
+            if isinstance(df, pd.DataFrame) and list(df.columns) == SIG_COLS:
+                _sig[d] = df
+                _sig_meta[d] = obj.get("sig_meta", {}).get(d, {})
+        _sector_code.update(obj.get("sector_code", {}))
+        _sector_name.update({int(k): v for k, v in obj.get("sector_name", {}).items()})
+        for k, df in obj.get("dart_raw", {}).items():
+            if isinstance(df, pd.DataFrame):
+                _dart_raw[k] = df
+                _dart_meta[k] = obj.get("dart_meta", {}).get(k, {})
+        if obj.get("corp_map"):
+            _corp_map = dict(obj["corp_map"])
+    if _dart_raw and DART_KEY:
+        _state["dart_status"] = "ready"
+    log.info("signals 캐시 복구: 월말 %d개, DART 분기 %d개 (저장 %s)", len(_sig), len(_dart_raw), obj.get("saved_at"))
+    return len(_sig)
+
+
 def ensure_signals(dates: list[str]) -> None:
     todo = [d for d in dates if d not in _sig]
     _state["sig_target"] = len(dates)
@@ -723,6 +767,8 @@ def ensure_signals(dates: list[str]) -> None:
             log.warning("신호 수집 실패 %s: %s", d, e)
         _state["sig_done"] += 1
         _sig_cache.clear()
+    if todo:
+        save_cache()
 
 
 def _wait_for_factors(max_wait_sec: int = 7200) -> list[str]:
@@ -832,6 +878,7 @@ def cache_status() -> dict[str, Any]:
                      "corp_map": len(_corp_map), "calls_done": st.get("dart_done"), "calls_target": st.get("dart_target"),
                      "panel_compute_error": _dart_compute_error["error"], "last_error": st.get("last_error")},
             "prefetch": st, "process_rss_mb": _rss_mb(),
+            "persist": cachestore.status(CACHE_NAME) if cachestore is not None else {"enabled": False},
             "factors_registered": [n for n in factors.ATOMIC_FACTORS if n in factors.EXTRA_FACTORS],
             "groups": {k: v for k, v in factors.GROUP_FACTORS.items() if k in ("earnings", "quality2", "sector", "flow", "shortint")},
             "note": "factors 월말 수집이 끝난 뒤 시작. 월말당 KRX 9회(약 20~30초), DART 분기당 약 30회. "
@@ -839,5 +886,9 @@ def cache_status() -> dict[str, Any]:
 
 
 register_all()
+try:
+    load_cache()
+except Exception as _e:  # noqa: BLE001
+    log.warning("signals 캐시 복구 중 오류(무시): %s", _e)
 if os.environ.get("SIGNALS_PREFETCH", "1") != "0":
     prefetch()

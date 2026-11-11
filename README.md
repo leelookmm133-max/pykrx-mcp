@@ -142,6 +142,15 @@ PER·PBR·EPS·BPS·DIV) + KOSPI 지수 일별(거래일 달력, 연 1회). 10�
 
 환경 변수: `DART_API_KEY`(OpenDART 인증키 — 없으면 DART 신호는 NaN, 나머지는 정상), `SIGNALS_PREFETCH=0` 자동 수집 끔, `SIGNALS_YEARS`(기본 10).
 
+### v1.4 (2026-11-11) — 계산 규칙 보강 · 캐시 영속화
+
+- **겹침 보정 t**: `hold_months>1` 이면 월간 수익률이 겹쳐 자기상관이 생기므로 `excess_t_stat` 은 Newey-West(시차 k−1) 보정값, `excess_t_stat_plain` 이 단순 t.
+- **거래비용·회전율**: `cost_pct`(왕복, 기본 0.5%) × 월 교체율로 비용을 근사해 `portfolio.cost`(비용 후 초과수익·t·CAGR)와 `avg_monthly_turnover_pct` 를 보고. 판정 기준 ①~⑤는 비용 전, ⑥(비용 후 > 0)은 참고.
+- **상장폐지**: 다음 달 스냅샷에서 사라진 종목은 그 달 수익률을 `delist_return_pct`(기본 −50%)로 간주(유니버스·포트 동일). 민감도는 0/−50/−90 비교. `period.delisted_in_universe_*` 에 건수.
+- **거래정지**: 월 거래량 0 인 종목은 편입 후보에서 제외(`exclude_suspended`, 기본 true).
+- **paper_test**: 같은 규칙을 적용하고 `registration.amendments` 에 개정 내용을 기록. 등록 참고치(+0.61%p·t 1.77)는 구방법 값이며 새 기준값은 `in_sample_reproduction`.
+- **캐시 영속화**(`cachestore.py`): Railway 볼륨을 붙이면(`RAILWAY_VOLUME_MOUNT_PATH` 자동, 또는 `CACHE_DIR`) 일별·월말·신호·DART 캐시를 pickle 로 저장해 재시작 시 몇 초 만에 복구. 볼륨이 없으면 기존처럼 동작. 상태는 `cache_persist_status`.
+
 ## 알아둘 것
 
 ### KRX 계정 (`KRX_ID` / `KRX_PW`)
