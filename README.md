@@ -149,7 +149,8 @@ PER·PBR·EPS·BPS·DIV) + KOSPI 지수 일별(거래일 달력, 연 1회). 10�
 - **상장폐지**: 다음 달 스냅샷에서 사라진 종목은 그 달 수익률을 `delist_return_pct`(기본 −50%)로 간주(유니버스·포트 동일). 민감도는 0/−50/−90 비교. `period.delisted_in_universe_*` 에 건수.
 - **거래정지**: 월 거래량 0 인 종목은 편입 후보에서 제외(`exclude_suspended`, 기본 true).
 - **paper_test**: 같은 규칙을 적용하고 `registration.amendments` 에 개정 내용을 기록. 등록 참고치(+0.61%p·t 1.77)는 구방법 값이며 새 기준값은 `in_sample_reproduction`.
-- **캐시 영속화**(`cachestore.py`): Railway 볼륨을 붙이면(`RAILWAY_VOLUME_MOUNT_PATH` 자동, 또는 `CACHE_DIR`) 일별·월말·신호·DART 캐시를 pickle 로 저장해 재시작 시 몇 초 만에 복구. 볼륨이 없으면 기존처럼 동작. 상태는 `cache_persist_status`.
+- **캐시 영속화**(`cachestore.py`): (1) Railway 볼륨(`RAILWAY_VOLUME_MOUNT_PATH` 자동 또는 `CACHE_DIR`) 또는 (2) GitHub Release 자산 — 저장소(`GITHUB_CACHE_REPO`, 기본 이 저장소)의 `cache` 태그 릴리스에 pickle 첨부. 업로드에는 `GITHUB_TOKEN`(fine-grained PAT, Contents: Read and write) 필요, 공개 저장소면 다운로드(복구)는 토큰 없이. 둘 다 없으면 기존처럼 매번 수집. 상태는 `cache_persist_status`.
+- **DART 병렬 수집**(v1.5): `fnlttMultiAcnt` 를 `DART_WORKERS`(기본 4)개 동시 호출 — 직렬 4시간 → 약 1시간. 수집 시작 연도는 첫 월말의 연도.
 
 ## 알아둘 것
 

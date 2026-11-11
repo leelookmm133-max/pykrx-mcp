@@ -1406,6 +1406,43 @@ def run_accum_screen(min_cap_억: float = 1000, accum_mult: float = 1.5, max_spi
             "source": "KRX via pykrx"}
 
 
+try:
+    import cachestore as _cachestore      # 같은 폴더. Railway 볼륨에 일별 캐시 저장·복구 (없으면 무시)
+except Exception:  # noqa: BLE001
+    _cachestore = None
+CACHE_NAME = "screener"
+CACHE_KEEP_DAYS = 520                     # 디스크에 남길 최근 거래일 수(500일 백테스트 + 여유)
+
+
+def save_cache() -> bool:
+    """일별 OHLCV 캐시(최근 CACHE_KEEP_DAYS 일)와 휴장일을 디스크에 저장(저장소가 있을 때만)."""
+    if _cachestore is None:
+        return False
+    with _lock:
+        keys = sorted(_ohlcv_by_date)[-CACHE_KEEP_DAYS:]
+        payload = {"version": 1, "ohlcv": {k: _ohlcv_by_date[k] for k in keys}, "holidays": set(_holidays),
+                   "saved_at": _today().strftime("%Y-%m-%d %H:%M:%S")}
+    return _cachestore.save(CACHE_NAME, payload)
+
+
+def load_cache() -> int:
+    """디스크 캐시 복구. 복구한 거래일 수(저장소 없으면 0)."""
+    if _cachestore is None:
+        return 0
+    obj = _cachestore.load(CACHE_NAME)
+    if not obj or not isinstance(obj, dict) or "ohlcv" not in obj:
+        return 0
+    n = 0
+    with _lock:
+        for d, df in obj["ohlcv"].items():
+            if isinstance(df, pd.DataFrame) and not df.empty and d not in _ohlcv_by_date:
+                _ohlcv_by_date[d] = df
+                n += 1
+        _holidays.update(obj.get("holidays", set()))
+    log.info("screener 캐시 복구: 거래일 %d개 (저장 %s)", n, obj.get("saved_at"))
+    return n
+
+
 def prefetch(days: int | None = None) -> None:
     """서버 시작 시(또는 백테스트 요청 시) 백그라운드로 캐시를 채웁니다."""
     days = int(days or PREFETCH_DAYS)
@@ -1418,6 +1455,7 @@ def prefetch(days: int | None = None) -> None:
             dates = _ensure_days(days)
             _prefetch_state["done"] = len(dates)
             _prefetch_state["finished_target"] = max(_prefetch_state.get("finished_target", 0), days)
+            save_cache()
         except Exception as e:  # noqa: BLE001
             _prefetch_state["last_error"] = str(e)
         finally:
@@ -1434,8 +1472,13 @@ def cache_status() -> dict[str, Any]:
     return {"cached_days": n, "earliest": earliest, "latest": latest, "prefetch": dict(_prefetch_state),
             "flow_job": dict(_flow_job), "flow_cached_dates": len(_flow_cache),
             "fundamental_cached_dates": len(_fund_cache), "tickers_known": len(_intern_tab),
-            "process_rss_mb": _rss_mb()}
+            "process_rss_mb": _rss_mb(),
+            "persist": _cachestore.status(CACHE_NAME) if _cachestore is not None else {"enabled": False}}
 
 
+try:
+    load_cache()                 # 볼륨이 있으면 지난 일별 캐시를 먼저 복구(없는 날만 받게 됨)
+except Exception as _e:  # noqa: BLE001
+    log.warning("screener 캐시 복구 중 오류(무시): %s", _e)
 if os.environ.get("SCREENER_PREFETCH", "1") != "0":
     prefetch()

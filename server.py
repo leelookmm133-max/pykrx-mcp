@@ -264,11 +264,18 @@ def health() -> dict[str, Any]:
     except Exception as e:
         # 예외 메시지만으로는 원인을 못 찾는 경우가 많아 타입과 pykrx 버전을 같이 남깁니다.
         ok, detail = False, f"pykrx 호출 실패: {type(e).__name__}: {e}"
+    # Railway 가 자동으로 넣어 주는 식별 변수 — 커넥터가 어느 프로젝트/서비스/도메인을 가리키는지 바로 확인용
+    railway = {k.replace("RAILWAY_", "").lower(): os.environ.get(k)
+               for k in ("RAILWAY_PROJECT_NAME", "RAILWAY_SERVICE_NAME", "RAILWAY_ENVIRONMENT_NAME",
+                         "RAILWAY_PUBLIC_DOMAIN", "RAILWAY_DEPLOYMENT_ID", "RAILWAY_GIT_COMMIT_SHA")
+               if os.environ.get(k)}
     return {
         "ok": ok,
         "detail": detail,
         "pykrx_version": getattr(__import__("pykrx"), "__version__", "unknown"),
         "server_time_kst": today_kst().strftime("%Y-%m-%d %H:%M:%S"),
+        "railway": railway or None,
+        "env_keys_set": {k: bool(os.environ.get(k)) for k in ("MCP_TOKEN", "KRX_ID", "KRX_PW", "DART_API_KEY", "CACHE_DIR", "RAILWAY_VOLUME_MOUNT_PATH")},
         "source": "KRX via pykrx",
     }
 
@@ -806,14 +813,19 @@ def signals_prefetch(years: float = 10) -> dict[str, Any]:
 
 @mcp.tool()
 def cache_persist_status() -> dict[str, Any]:
-    """디스크 캐시 영속화 상태. Railway 볼륨을 서비스에 붙이면(RAILWAY_VOLUME_MOUNT_PATH 자동 설정, 또는 CACHE_DIR 지정)
-    일별(screener)·월말(factors)·신호/DART(signals) 캐시를 pickle 로 저장해 재시작 때 KRX 재수집 없이 몇 초 만에 복구합니다.
-    enabled=false 면 저장소가 없어 기존처럼 매번 받습니다."""
+    """캐시 영속화 상태. 로컬 볼륨(RAILWAY_VOLUME_MOUNT_PATH/CACHE_DIR) 또는 GitHub Release 자산(GITHUB_TOKEN 으로 업로드,
+    공개 저장소면 다운로드는 토큰 없이)에 일별(screener)·월말(factors)·신호/DART(signals) 캐시를 pickle 로 저장해
+    재시작 때 KRX/DART 재수집 없이 몇 초~수십 초 만에 복구합니다. github.can_upload 가 false 면 저장은 안 되고 복구만 시도합니다."""
     import cachestore
     return {"store": cachestore.status(), "screener": cachestore.status("screener"), "factors": cachestore.status("factors"),
             "signals": cachestore.status("signals"),
-            "env": {"CACHE_DIR": os.environ.get("CACHE_DIR"), "RAILWAY_VOLUME_MOUNT_PATH": os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")},
-            "how_to": "Railway 캔버스에서 서비스 우클릭 → Add Volume(마운트 경로 예: /data) → 재배포. 첫 수집이 끝나면 자동 저장되고 그다음 재시작부터 복구됩니다."}
+            "env": {"CACHE_DIR": os.environ.get("CACHE_DIR"), "RAILWAY_VOLUME_MOUNT_PATH": os.environ.get("RAILWAY_VOLUME_MOUNT_PATH"),
+                    "GITHUB_CACHE_REPO": os.environ.get("GITHUB_CACHE_REPO", "leelookmm133-max/pykrx-mcp"),
+                    "GITHUB_TOKEN_set": bool(os.environ.get("GITHUB_TOKEN"))},
+            "how_to": "방법 1(볼륨): Railway 서비스 우클릭 → Add Volume(마운트 /data) → 재배포. "
+                      "방법 2(GitHub Release, 무료 플랜용): GitHub fine-grained 토큰(해당 저장소 Contents: Read and write)을 Railway 변수 "
+                      "GITHUB_TOKEN 으로 넣으면 캐시를 저장소의 'cache' 릴리스 자산으로 올리고, 재시작 때 거기서 내려받습니다(공개 저장소면 "
+                      "다운로드는 토큰 없이도 됨). 첫 수집이 끝나면 자동 저장되고 그다음 재시작부터 복구됩니다."}
 
 
 @mcp.tool()

@@ -28,7 +28,8 @@ factors.py 의 팩터 레지스트리(register_factor)에 신호를 팩터로 �
 
 데이터 수집 (서버 시작 시 factors 의 월말 수집이 끝난 뒤 백그라운드로)
   - 월말당 KRX 9회: 업종분류 2(KOSPI·KOSDAQ) + 순매수 4(2시장×외국인·기관) + 공매도잔고 2 + 외국인보유 1  → 10년 ≈ 1,200회(약 40분)
-  - DART: 고유번호 목록 1회 + 다중회사 주요계정(fnlttMultiAcnt, 회사 100개씩) 분기마다 약 30회 → 10년 ≈ 1,300회(약 15분).
+  - DART: 고유번호 목록 1회 + 다중회사 주요계정(fnlttMultiAcnt, 회사 100개씩, DART_WORKERS=4 동시) 분기마다 약 30회 → 10년 ≈ 1,400회.
+    DART 응답이 호출당 10초 안팎이라 직렬이면 4시간, 4개 동시면 약 1시간.
     DART_API_KEY 환경변수가 없으면 DART 신호는 비어 있고(NaN) 나머지는 정상 동작.
   - 메모리: 월말 신호 1개 ≈ 0.15MB, DART 분기 1개 ≈ 0.4MB → 10년 합계 약 40MB.
   - 공매도 잔고는 2016-06 이후, 공매도 금지 기간(2020-03~2021-05 전면, 2023-11~2025-03 전면)에는 잔고가 줄어 변화량 해석에 주의.
@@ -322,44 +323,58 @@ def _match_account(name: str) -> str | None:
     return None
 
 
-def fetch_dart_period(year: int, q: str, codes: list[str]) -> pd.DataFrame:
-    """해당 연도·분기의 주요계정을 회사 100개씩 받아 종목코드별 한 행으로. 연결(CFS) 우선, 없으면 개별(OFS)."""
-    reprt = REPRT[q]
-    rows: dict[str, dict[str, Any]] = {}
-    pref: dict[str, str] = {}
-    chunks = [codes[i:i + 100] for i in range(0, len(codes), 100)]
-    for ci, chunk in enumerate(chunks):
-        corp_codes = [_corp_map[c] for c in chunk if c in _corp_map]
-        if not corp_codes:
+DART_WORKERS = int(os.environ.get("DART_WORKERS", "4"))     # fnlttMultiAcnt 동시 호출 수(응답이 호출당 10초 안팎이라 병렬이 효과적)
+
+
+def _parse_dart_items(items: list[dict[str, Any]], rows: dict[str, dict[str, Any]], pref: dict[str, str]) -> None:
+    """주요계정 응답 행들을 종목코드별 한 행(dict)으로 누적. 연결(CFS) 우선, 없으면 개별(OFS)."""
+    for it in items:
+        sc = str(it.get("stock_code", "")).strip()
+        if len(sc) != 6:
             continue
+        key = _match_account(it.get("account_nm", ""))
+        if key is None:
+            continue
+        fs = str(it.get("fs_div", "")).upper()
+        cur = pref.get(sc)
+        if cur is None or (cur == "OFS" and fs == "CFS"):
+            if cur == "OFS" and fs == "CFS":
+                rows[sc] = {}                  # 개별로 채운 값을 버리고 연결로 다시
+            pref[sc] = fs
+        if fs != pref[sc]:
+            continue
+        row = rows.setdefault(sc, {})
+        row["rcept"] = str(it.get("rcept_no", ""))[:8]
+        row[f"{key}_cur"] = _to_f(it.get("thstrm_amount"))
+        row[f"{key}_cur_add"] = _to_f(it.get("thstrm_add_amount"))
+        row[f"{key}_py"] = _to_f(it.get("frmtrm_amount"))
+        row[f"{key}_py_add"] = _to_f(it.get("frmtrm_add_amount"))
+
+
+def fetch_dart_period(year: int, q: str, codes: list[str]) -> pd.DataFrame:
+    """해당 연도·분기의 주요계정을 회사 100개씩(DART_WORKERS 개 동시에) 받아 종목코드별 한 행으로."""
+    reprt = REPRT[q]
+    chunks = [[_corp_map[c] for c in codes[i:i + 100] if c in _corp_map] for i in range(0, len(codes), 100)]
+    chunks = [c for c in chunks if c]
+
+    def _one(corp_codes: list[str]):
         js = _dart_get("fnlttMultiAcnt.json", {"corp_code": ",".join(corp_codes), "bsns_year": str(year), "reprt_code": reprt})
         if DART_DELAY > 0:
             time.sleep(DART_DELAY)
-        if not js or not js.get("list"):
-            continue
-        for it in js["list"]:
-            sc = str(it.get("stock_code", "")).strip()
-            if len(sc) != 6:
-                continue
-            key = _match_account(it.get("account_nm", ""))
-            if key is None:
-                continue
-            fs = str(it.get("fs_div", "")).upper()
-            # 연결 우선: 연결 행을 한 번이라도 보면 그 회사는 연결만 사용
-            cur = pref.get(sc)
-            if cur is None or (cur == "OFS" and fs == "CFS"):
-                if cur == "OFS" and fs == "CFS":
-                    rows[sc] = {}                  # 개별로 채운 값을 버리고 연결로 다시
-                pref[sc] = fs
-            if fs != pref[sc]:
-                continue
-            row = rows.setdefault(sc, {})
-            row["rcept"] = str(it.get("rcept_no", ""))[:8]
-            row[f"{key}_cur"] = _to_f(it.get("thstrm_amount"))
-            row[f"{key}_cur_add"] = _to_f(it.get("thstrm_add_amount"))
-            row[f"{key}_py"] = _to_f(it.get("frmtrm_amount"))
-            row[f"{key}_py_add"] = _to_f(it.get("frmtrm_add_amount"))
-        _state["dart_done"] = _state.get("dart_done", 0) + 1
+        _state["dart_done"] = _state.get("dart_done", 0) + 1        # 빈 응답이어도 호출 1회로 센다
+        return (js or {}).get("list") or []
+
+    rows: dict[str, dict[str, Any]] = {}
+    pref: dict[str, str] = {}
+    results: list[list[dict[str, Any]]] = []
+    if DART_WORKERS > 1 and len(chunks) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=DART_WORKERS, thread_name_prefix="dart") as ex:
+            results = list(ex.map(_one, chunks))
+    else:
+        results = [_one(c) for c in chunks]
+    for items in results:                     # 응답 순서를 고정해 결과가 재현되게
+        _parse_dart_items(items, rows, pref)
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame.from_dict(rows, orient="index")
@@ -409,10 +424,11 @@ def ensure_dart(dates: list[str]) -> None:
     if not codes:
         _state["dart_status"] = "no_tickers"
         return
-    first_year = int(dates[0][:4]) - 1 if dates else _today().year - 1
+    first_year = int(dates[0][:4]) if dates else _today().year - 1
     periods = _quarters_available(first_year)
     todo = [(y, q) for (y, q) in periods if f"{y}{q}" not in _dart_raw]
     _state["dart_target"] = _state.get("dart_done", 0) + len(todo) * max(1, (len(codes) + 99) // 100)
+    _state["dart_eta_note"] = f"분기 {len(todo)}개 × 호출 {max(1, (len(codes) + 99) // 100)}회, 동시 {DART_WORKERS}개"
     _state["dart_status"] = "running"
     for (y, q) in todo:
         df = fetch_dart_period(y, q, codes)
@@ -832,7 +848,7 @@ def refresh_recent() -> None:
     if missing:
         ensure_signals(dates)
     if DART_KEY:
-        periods = _quarters_available(int(dates[0][:4]) - 1) if dates else []
+        periods = _quarters_available(int(dates[0][:4])) if dates else []
         if any(f"{y}{q}" not in _dart_raw for (y, q) in periods):
             ensure_dart(dates)
             _dart_cache.clear()
@@ -845,7 +861,7 @@ def refresh_recent_async() -> None:
     with factors._lock:
         dates = sorted(factors._snaps)
     need_sig = any(d not in _sig for d in dates[-2:]) if dates else False
-    need_dart = bool(DART_KEY and dates and any(f"{y}{q}" not in _dart_raw for (y, q) in _quarters_available(int(dates[0][:4]) - 1)))
+    need_dart = bool(DART_KEY and dates and any(f"{y}{q}" not in _dart_raw for (y, q) in _quarters_available(int(dates[0][:4]))))
     if not (need_sig or need_dart):
         return
 
