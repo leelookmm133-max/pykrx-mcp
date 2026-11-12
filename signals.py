@@ -28,8 +28,9 @@ factors.py 의 팩터 레지스트리(register_factor)에 신호를 팩터로 �
 
 데이터 수집 (서버 시작 시 factors 의 월말 수집이 끝난 뒤 백그라운드로)
   - 월말당 KRX 9회: 업종분류 2(KOSPI·KOSDAQ) + 순매수 4(2시장×외국인·기관) + 공매도잔고 2 + 외국인보유 1  → 10년 ≈ 1,200회(약 40분)
-  - DART: 고유번호 목록 1회 + 다중회사 주요계정(fnlttMultiAcnt, 회사 100개씩, DART_WORKERS=4 동시) 분기마다 약 30회 → 10년 ≈ 1,400회.
-    DART 응답이 호출당 10초 안팎이라 직렬이면 4시간, 4개 동시면 약 1시간.
+  - DART: 고유번호 목록 1회 + 다중회사 주요계정(fnlttMultiAcnt, 회사 100개씩) 분기마다 약 20회(어느 월말이든 시총 DART_MIN_CAP_EOK=300억
+    이상이었던 보통주만) → 10년 ≈ 900회. DART 가 키당 분당 4~6회 정도로 응답해 약 2.5~3시간. 4개 분기마다 중간 저장(GitHub Release)해
+    재배포로 끊겨도 이어받음.
     DART_API_KEY 환경변수가 없으면 DART 신호는 비어 있고(NaN) 나머지는 정상 동작.
   - 메모리: 월말 신호 1개 ≈ 0.15MB, DART 분기 1개 ≈ 0.4MB → 10년 합계 약 40MB.
   - 공매도 잔고는 2016-06 이후, 공매도 금지 기간(2020-03~2021-05 전면, 2023-11~2025-03 전면)에는 잔고가 줄어 변화량 해석에 주의.
@@ -323,7 +324,7 @@ def _match_account(name: str) -> str | None:
     return None
 
 
-DART_WORKERS = int(os.environ.get("DART_WORKERS", "4"))     # fnlttMultiAcnt 동시 호출 수(응답이 호출당 10초 안팎이라 병렬이 효과적)
+DART_WORKERS = int(os.environ.get("DART_WORKERS", "2"))     # fnlttMultiAcnt 동시 호출 수(실측: 키당 분당 4~6회로 제한되는 듯해 2면 충분)
 
 
 def _parse_dart_items(items: list[dict[str, Any]], rows: dict[str, dict[str, Any]], pref: dict[str, str]) -> None:
@@ -418,9 +419,17 @@ def ensure_dart(dates: list[str]) -> None:
     if not load_corp_map():
         _state["dart_status"] = "corp_map_failed"
         return
+    # 수집 대상: 어느 월말이든 시총이 DART_MIN_CAP_억 이상이었던 보통주(백테스트 유니버스 하한보다 넉넉하게). 호출 수를 줄이기 위함.
+    min_cap = float(os.environ.get("DART_MIN_CAP_EOK", "300")) * 1e8
     with factors._lock:
-        tickers = sorted(set().union(*[set(f.index) for f in factors._snaps.values()])) if factors._snaps else []
-    codes = [t for t in tickers if t in _corp_map and t.endswith("0")]
+        snaps = list(factors._snaps.values())
+    cand: set[str] = set()
+    for f in snaps:
+        if "cap" in f.columns and "common" in f.columns:
+            ok = (f["cap"] >= min_cap) & (f["common"] > 0)
+            cand.update(str(t) for t in f.index[ok.to_numpy()])
+    codes = sorted(t for t in cand if t in _corp_map and t.endswith("0"))
+    _state["dart_companies"] = len(codes)
     if not codes:
         _state["dart_status"] = "no_tickers"
         return
@@ -430,12 +439,14 @@ def ensure_dart(dates: list[str]) -> None:
     _state["dart_target"] = _state.get("dart_done", 0) + len(todo) * max(1, (len(codes) + 99) // 100)
     _state["dart_eta_note"] = f"분기 {len(todo)}개 × 호출 {max(1, (len(codes) + 99) // 100)}회, 동시 {DART_WORKERS}개"
     _state["dart_status"] = "running"
-    for (y, q) in todo:
+    for i, (y, q) in enumerate(todo, 1):
         df = fetch_dart_period(y, q, codes)
         with _lock:
             _dart_raw[f"{y}{q}"] = df
             _dart_meta[f"{y}{q}"] = {"n": int(len(df)), "fetched_at": _ymd(_today())}
         _malloc_trim()
+        if i % 4 == 0 and i < len(todo):
+            save_cache()                      # 중간 저장: 재배포로 끊겨도 받은 분기는 복구됨
     _state["dart_status"] = "ready"
     if todo:
         save_cache()
@@ -891,7 +902,8 @@ def cache_status() -> dict[str, Any]:
             "dart": {"status": st.get("dart_status"), "key_set": bool(DART_KEY), "key_len": len(DART_KEY), "quarters": len(dart_keys),
                      "first": dart_keys[0] if dart_keys else None, "last": dart_keys[-1] if dart_keys else None,
                      "companies_per_quarter_avg": int(np.mean([v for v in dart_n.values() if v])) if any(dart_n.values()) else 0,
-                     "corp_map": len(_corp_map), "calls_done": st.get("dart_done"), "calls_target": st.get("dart_target"),
+                     "corp_map": len(_corp_map), "companies_fetched": st.get("dart_companies"),
+                     "calls_done": st.get("dart_done"), "calls_target": st.get("dart_target"),
                      "panel_compute_error": _dart_compute_error["error"], "last_error": st.get("last_error")},
             "prefetch": st, "process_rss_mb": _rss_mb(),
             "persist": cachestore.status(CACHE_NAME) if cachestore is not None else {"enabled": False},
