@@ -20,20 +20,32 @@ factors.py 의 팩터 레지스트리(register_factor)에 신호를 팩터로 �
     flow20    (외국인 + 기관합계) 20거래일 순매수대금 / 시총
     flow60    최근 3개 월말의 20거래일 순매수 합 / 시총
     frgn_chg  외국인 지분율 3개월 변화(%p)
-  [공매도 — KRX 공매도 잔고]
-    short_bal 공매도 잔고 비중(%)  (낮을수록 좋음)
+  [공매도 — KRX 공매도 잔고, 공표 시차 반영]
+    short_bal 공매도 잔고 비중(%) — 월말 2거래일 전 잔고(월말 시점에 공표돼 있던 최신값)  (낮을수록 좋음)
     short_chg 잔고 비중 3개월 변화(%p) (낮을수록 좋음)
+  [DART 장부가]
+    bm_q      최근 분기 자본총계 / 시가총액 (KRX PBR 보다 최신 장부가; 진단용 단독 팩터)
   그룹: earnings=[epm, sales_g, opm_chg]  quality2=[roe_ttm, agr]  sector=[sec_mom, rs3, sec_margin]
         flow=[flow20, flow60, frgn_chg]  shortint=[short_bal, short_chg]
 
+자료 시점(v1.7 보정 — 편입일 종가에 실제로 알 수 있던 값만 쓰도록)
+  - 공매도 잔고: KRX 는 T일 잔고를 T+2 거래일에 공표한다(실측: 11/12 밤에 조회하면 잔고는 11/10 까지). 그래서 월말 신호는
+    '월말 2거래일 전 잔고'를 쓴다. v1.6 까지는 월말 당일 잔고를 써서 2거래일치 미래 정보가 섞여 있었다.
+  - DART: 접수일이 편입일보다 '앞선' 보고서만 반영(접수일 당일은 장 마감 뒤 제출일 수 있어 다음 날부터). v1.6 까지는 당일 포함.
+  - 분기 수집: 분기말 + 20일부터 잠정 수집(조기 제출 회사 반영), 제출기한 + 10일 뒤에 받은 것은 확정. 잠정 분기는 하루(기한 3주 전까지는
+    7일)에 한 번 다시 받고, 등록 전략 편입 때는 편입일 이후에 받은 자료가 있어야 한다(없으면 다시 받는 동안 status=preparing).
+    과거 백테스트는 모든 보고서를 실제 접수일로 쓰므로, 실시간 수집도 같은 정보를 보도록 맞춘 것이다.
+
 데이터 수집 (서버 시작 시 factors 의 월말 수집이 끝난 뒤 백그라운드로)
-  - 월말당 KRX 9회: 업종분류 2(KOSPI·KOSDAQ) + 순매수 4(2시장×외국인·기관) + 공매도잔고 2 + 외국인보유 1  → 10년 ≈ 1,200회(약 40분)
-  - DART: 고유번호 목록 1회 + 다중회사 주요계정(fnlttMultiAcnt, 회사 100개씩) 분기마다 약 20회(어느 월말이든 시총 DART_MIN_CAP_EOK=300억
-    이상이었던 보통주만) → 10년 ≈ 900회. DART 가 키당 분당 4~6회 정도로 응답해 약 2.5~3시간. 4개 분기마다 중간 저장(GitHub Release)해
+  - 월말당 KRX 9회: 업종분류 2(KOSPI·KOSDAQ) + 순매수 4(2시장×외국인·기관) + 공매도잔고(T−2) 2 + 외국인보유 1  → 10년 ≈ 1,200회(약 40분)
+    (v1.7 로 올린 직후 한 번, 기존 월말들의 T−2 잔고를 추가로 받는다: 약 250회, 10~15분)
+  - DART: 고유번호 목록 1회 + 다중회사 주요계정(fnlttMultiAcnt, 회사 100개씩) 분기마다 약 29회(어느 월말이든 시총 DART_MIN_CAP_EOK=300억
+    이상이었던 보통주 약 2,900개). DART 가 키당 분당 4~6회 정도로 응답해 분기 하나에 약 6분. 4개 분기마다 중간 저장(GitHub Release)해
     재배포로 끊겨도 이어받음.
     DART_API_KEY 환경변수가 없으면 DART 신호는 비어 있고(NaN) 나머지는 정상 동작.
   - 메모리: 월말 신호 1개 ≈ 0.15MB, DART 분기 1개 ≈ 0.4MB → 10년 합계 약 40MB.
-  - 공매도 잔고는 2016-06 이후, 공매도 금지 기간(2020-03~2021-05 전면, 2023-11~2025-03 전면)에는 잔고가 줄어 변화량 해석에 주의.
+  - 공매도 잔고는 2016-06 이후. 금지 구간(전면 2020-03-16~2021-05-02, 2023-11-06~2025-03-30 / 부분 허용 2021-05-03~2023-11-05)에는
+    잔고가 줄어 변화량 해석에 주의 — backtest_factors(split="short_ban") 로 구간별 성과를 나눠 본다.
 
 결과는 과거 통계이며 매매 권유가 아닙니다.
 """
@@ -82,15 +94,25 @@ _sector_code: dict[str, int] = {}              # 업종명 -> 코드
 _sector_name: dict[int, str] = {}
 _sig_meta: dict[str, dict[str, Any]] = {}
 _dart_raw: dict[str, pd.DataFrame] = {}        # "2023Q1" -> 분기 주요계정 (index=stock_code)
-_dart_meta: dict[str, dict[str, Any]] = {}
+_dart_meta: dict[str, dict[str, Any]] = {}     # "2023Q1" -> {"n", "fetched_at"(YYYYMMDD), "fetched_ts", "provisional"}
+_dart_fail: dict[str, float] = {}              # "2023Q1" -> 마지막 수집 실패 시각(time.time) — DART_RETRY_SEC 동안 다시 시도하지 않음
 _corp_map: dict[str, str] = {}                 # stock_code -> corp_code
+# 공매도 잔고(공표 시차 반영): 월말 -> 그 월말에 공표돼 있던 최신 잔고 비중(= 월말 SHORT_LAG_DAYS 거래일 전 잔고)
+_short_l2: dict[str, pd.Series] = {}
+_short_l2_meta: dict[str, dict[str, Any]] = {}  # 월말 -> {"date": 잔고 기준일, "n": 종목 수, "tried": 시도 시각}
 _state: dict[str, Any] = {"running": False, "sig_done": 0, "sig_target": 0, "dart_done": 0, "dart_target": 0,
                           "last_error": None, "dart_status": "no_key" if not DART_KEY else "idle",
-                          "started_at": None, "finished_at": None}
+                          "started_at": None, "finished_at": None, "short_lag_done": 0, "short_lag_target": 0}
 
+SHORT_LAG_DAYS = int(os.environ.get("SHORT_LAG_DAYS", "2"))     # KRX 공매도 잔고 공표 시차(거래일): T일 잔고는 T+2일에 공표
+SHORT_DATA_FROM = "20160630"                                    # 공매도 잔고 공시 시작(2016-06-30) 이전 월말은 받지 않는다
 REPRT = {"Q1": "11013", "Q2": "11012", "Q3": "11014", "Q4": "11011"}     # Q4 는 사업보고서(연간)에서 도출
-# 보고서 법정 제출기한(이 날짜가 지나야 조회): 1분기 5/15, 반기 8/14, 3분기 11/14, 사업보고서 다음해 3/31
+# 보고서 법정 제출기한 다음 날: 1분기 5/15, 반기 8/14, 3분기 11/14, 사업보고서 다음해 3/31(주말이면 다음 영업일로 밀린다)
 _DEADLINE = {"Q1": (5, 16), "Q2": (8, 15), "Q3": (11, 15), "Q4": (3, 31)}
+_QEND = {"Q1": (3, 31), "Q2": (6, 30), "Q3": (9, 30), "Q4": (12, 31)}
+DART_EARLY_DAYS = int(os.environ.get("DART_EARLY_DAYS", "20"))   # 분기말 + 20일부터 잠정 수집(조기 제출 회사 반영)
+DART_FINAL_DAYS = int(os.environ.get("DART_FINAL_DAYS", "10"))   # 제출기한 + 10일 뒤에 받은 분기는 확정(다시 받지 않음)
+DART_RETRY_SEC = 600                                             # 수집 실패 후 다시 시도하기까지의 최소 간격(초)
 ACCOUNT_PATTERNS = {
     "sales": ("매출액", "수익(매출액)", "영업수익", "매출"),
     "op": ("영업이익", "영업이익(손실)", "영업손익"),
@@ -219,12 +241,50 @@ def _frgn_hold_frame(ymd: str) -> pd.Series:
     return pd.Series({str(t): float(v) for t, v in zip(df.index, vals.values) if not np.isnan(v)}, dtype="float64")
 
 
+def _lag_date(ymd: str, n: int) -> str:
+    """ymd(거래일)에서 n 거래일 전 날짜. 달력이 없으면 주말만 건너뛰어 근사."""
+    days = factors._calendar.get("days") or []
+    if days:
+        arr = np.array(days)
+        i = int(np.searchsorted(arr, ymd, side="right")) - 1          # ymd 이하 마지막 거래일
+        if i - n >= 0:
+            return days[i - n]
+    d = datetime.strptime(ymd, "%Y%m%d")
+    k = 0
+    while k < n:
+        d -= timedelta(days=1)
+        if d.weekday() < 5:
+            k += 1
+    return _ymd(d)
+
+
+def fetch_short_lag(ymd: str) -> int:
+    """월말 ymd 시점에 공표돼 있던 최신 공매도 잔고(= ymd 의 SHORT_LAG_DAYS 거래일 전 잔고)를 받아 _short_l2 에 넣는다.
+    받은 종목 수를 돌려준다(0 이면 KRX 가 아직 공표 전이거나 조회 실패 — 나중에 다시 시도)."""
+    lag = _lag_date(ymd, SHORT_LAG_DAYS)
+    s = _short_frame(lag)
+    n = int(s.notna().sum()) if len(s) else 0
+    with _lock:
+        if n > 0:
+            _short_l2[ymd] = pd.Series(np.ascontiguousarray(s.to_numpy(dtype=float)),
+                                       index=pd.Index([_intern(t) for t in s.index], dtype=object, name="ticker"))
+        _short_l2_meta[ymd] = {"date": lag, "n": n, "tried": time.time()}
+    _short_cache.clear()
+    return n
+
+
 def fetch_month(ymd: str) -> pd.DataFrame:
-    """월말 하나의 KRX 신호 표(SIG_COLS)."""
+    """월말 하나의 KRX 신호 표(SIG_COLS). 공매도 잔고는 공표 시차를 반영해 따로(_short_l2) 받고, 표의 short_bal 열(월말 당일 잔고)은
+    v1.7 부터 새 월말에는 채우지 않는다(월초에는 아직 공표 전이고, 팩터도 더는 쓰지 않음)."""
     sector = _sector_frame(ymd)
     start20 = _window_start(ymd, 20)
     frgn, inst = _net_frame(start20, ymd)
-    short = _short_frame(ymd)
+    short = pd.Series(dtype="float64")
+    if ymd >= SHORT_DATA_FROM:
+        try:
+            fetch_short_lag(ymd)
+        except Exception as e:  # noqa: BLE001
+            log.warning("공매도 잔고(T-%d) 수집 실패 %s: %s", SHORT_LAG_DAYS, ymd, e)
     hold = _frgn_hold_frame(ymd)
     idx = sorted(set(sector.index) | set(frgn.index) | set(inst.index) | set(short.index) | set(hold.index))
     df = pd.DataFrame({"sector": sector.reindex(idx), "frgn20": frgn.reindex(idx), "inst20": inst.reindex(idx),
@@ -243,6 +303,12 @@ def fetch_month(ymd: str) -> pd.DataFrame:
 # ────────────────────────────────────────────────────────────
 # DART 분기 재무 (다중회사 주요계정)
 # ────────────────────────────────────────────────────────────
+def _redact(s: Any) -> str:
+    """오류 문구에서 DART 인증키를 가린다(상태 조회 결과에 키가 노출되지 않게)."""
+    t = str(s)
+    return t.replace(DART_KEY, "***") if DART_KEY else t
+
+
 def _dart_get(endpoint: str, params: dict[str, Any], raw: bool = False):
     """DART OpenAPI 호출. raw=True 면 bytes(zip 등), 아니면 JSON dict. 실패 시 None."""
     if not DART_KEY:
@@ -268,19 +334,36 @@ def _dart_get(endpoint: str, params: dict[str, Any], raw: bool = False):
         except Exception as e:  # noqa: BLE001
             last = f"{type(e).__name__}: {e}"
         time.sleep(1.5 * (i + 1))
+    last = _redact(last)                      # requests 예외 문구에는 인증키가 든 전체 URL 이 들어갈 수 있다 → 가린다
     _state["last_error"] = f"{endpoint}: {last}"
     log.warning("DART 호출 실패 %s %s: %s", endpoint, {k: v for k, v in params.items() if k != 'corp_code'}, last)
     return None
 
 
-def load_corp_map() -> dict[str, str]:
-    """상장사 종목코드 -> DART 고유번호."""
+_corp_map_at: dict[str, Any] = {"ymd": None}      # 고유번호 목록을 받은 날(YYYYMMDD)
+CORP_MAP_REFRESH_DAYS = 30                          # 신규 상장사를 반영하려고 30일마다 다시 받는다
+
+
+def _corp_map_fresh() -> bool:
+    at = _corp_map_at.get("ymd")
+    if at is None:                           # 받은 날을 모르는 옛 캐시: 지금 받은 것으로 치고 30일 뒤에 갱신
+        _corp_map_at["ymd"] = _ymd(_today())
+        return True
+    try:
+        return (_naive() - datetime.strptime(str(at), "%Y%m%d")).days < CORP_MAP_REFRESH_DAYS
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def load_corp_map(force: bool = False) -> dict[str, str]:
+    """상장사 종목코드 -> DART 고유번호. 캐시가 CORP_MAP_REFRESH_DAYS 일보다 오래됐으면 다시 받는다(실패하면 옛 목록 유지)."""
     global _corp_map
-    if _corp_map:
+    if _corp_map and not force and _corp_map_fresh():
         return _corp_map
+    old = _corp_map
     content = _dart_get("corpCode.xml", {}, raw=True)
     if not content:
-        return {}
+        return old
     out: dict[str, str] = {}
     if not content[:2] == b"PK":            # zip 이 아니면 DART 가 오류 본문(XML/JSON)을 보낸 것 — 키 오류 등
         snippet = content[:300].decode("utf-8", "ignore")
@@ -288,12 +371,12 @@ def load_corp_map() -> dict[str, str]:
         msg = f"status {m.group(1)}: {m.group(2)}" if m else snippet.strip()
         _state["last_error"] = f"corpCode.xml 응답이 zip 이 아님 → {msg}"
         log.warning("DART corpCode 오류: %s", msg)
-        return {}
+        return old
     try:
         with zipfile.ZipFile(io.BytesIO(content)) as zf:
             name = next((n for n in zf.namelist() if n.lower().endswith(".xml")), None)
             if name is None:
-                return {}
+                return old
             root = ElementTree.fromstring(zf.read(name))
         for el in root.iter("list"):
             sc = (el.findtext("stock_code") or "").strip()
@@ -303,8 +386,11 @@ def load_corp_map() -> dict[str, str]:
     except Exception as e:  # noqa: BLE001
         _state["last_error"] = f"corpCode 파싱 실패: {e}"
         log.warning("corpCode 파싱 실패: %s", e)
-        return {}
+        return old
+    if not out:
+        return old
     _corp_map = out
+    _corp_map_at["ymd"] = _ymd(_today())
     return out
 
 
@@ -352,8 +438,9 @@ def _parse_dart_items(items: list[dict[str, Any]], rows: dict[str, dict[str, Any
         row[f"{key}_py_add"] = _to_f(it.get("frmtrm_add_amount"))
 
 
-def fetch_dart_period(year: int, q: str, codes: list[str]) -> pd.DataFrame:
-    """해당 연도·분기의 주요계정을 회사 100개씩(DART_WORKERS 개 동시에) 받아 종목코드별 한 행으로."""
+def fetch_dart_period(year: int, q: str, codes: list[str]) -> tuple[pd.DataFrame, int]:
+    """해당 연도·분기의 주요계정을 회사 100개씩(DART_WORKERS 개 동시에) 받아 종목코드별 한 행으로.
+    반환: (표, 실패한 호출 수). 실패(네트워크·키 오류)와 '아직 제출한 회사 없음'(status 013 → 빈 목록)을 구분한다."""
     reprt = REPRT[q]
     chunks = [[_corp_map[c] for c in codes[i:i + 100] if c in _corp_map] for i in range(0, len(codes), 100)]
     chunks = [c for c in chunks if c]
@@ -363,27 +450,31 @@ def fetch_dart_period(year: int, q: str, codes: list[str]) -> pd.DataFrame:
         if DART_DELAY > 0:
             time.sleep(DART_DELAY)
         _state["dart_done"] = _state.get("dart_done", 0) + 1        # 빈 응답이어도 호출 1회로 센다
-        return (js or {}).get("list") or []
+        if js is None:
+            return None                                              # 호출 실패
+        return js.get("list") or []
 
     rows: dict[str, dict[str, Any]] = {}
     pref: dict[str, str] = {}
-    results: list[list[dict[str, Any]]] = []
+    results: list[list[dict[str, Any]] | None] = []
     if DART_WORKERS > 1 and len(chunks) > 1:
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=DART_WORKERS, thread_name_prefix="dart") as ex:
             results = list(ex.map(_one, chunks))
     else:
         results = [_one(c) for c in chunks]
+    failed = sum(1 for r in results if r is None)
     for items in results:                     # 응답 순서를 고정해 결과가 재현되게
-        _parse_dart_items(items, rows, pref)
+        if items:
+            _parse_dart_items(items, rows, pref)
     if not rows:
-        return pd.DataFrame()
+        return pd.DataFrame(), failed
     df = pd.DataFrame.from_dict(rows, orient="index")
     df.index = pd.Index([_intern(t) for t in df.index], dtype=object, name="ticker")
     for c in df.columns:
         if c != "rcept":
             df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
+    return df, failed
 
 
 def _to_f(x) -> float:
@@ -398,28 +489,68 @@ def _to_f(x) -> float:
         return np.nan
 
 
+def _q_times(y: int, q: str) -> tuple[datetime, datetime, datetime]:
+    """분기 (y, q) 의 (잠정 수집 시작일, 제출기한 다음 날, 확정일)."""
+    qm, qd = _QEND[q]
+    start = datetime(y, qm, qd) + timedelta(days=DART_EARLY_DAYS)
+    m, d = _DEADLINE[q]
+    due = datetime(y + 1 if q == "Q4" else y, m, d)
+    return start, due, due + timedelta(days=DART_FINAL_DAYS)
+
+
+def _naive(now: datetime | None = None) -> datetime:
+    return (now or _today()).replace(tzinfo=None)
+
+
 def _quarters_available(first_year: int, now: datetime | None = None) -> list[tuple[int, str]]:
-    """제출기한이 지난 (연도, 분기) 목록, 시간순."""
-    now = now or _today()
+    """수집할 수 있는 (연도, 분기) 목록, 시간순. v1.7: 제출기한이 아니라 '분기말 + DART_EARLY_DAYS 일'부터(잠정 수집)."""
+    n = _naive(now)
     out = []
-    for y in range(first_year, now.year + 1):
+    for y in range(first_year, n.year + 1):
         for q in ("Q1", "Q2", "Q3", "Q4"):
-            m, d = _DEADLINE[q]
-            due = datetime(y + 1 if q == "Q4" else y, m, d)
-            if now.replace(tzinfo=None) >= due:
+            if n >= _q_times(y, q)[0]:
                 out.append((y, q))
     return out
 
 
-def ensure_dart(dates: list[str]) -> None:
-    """월말 목록이 필요로 하는 분기 재무를 (없으면) 받아 캐시."""
-    if not DART_KEY:
-        _state["dart_status"] = "no_key"
-        return
-    if not load_corp_map():
-        _state["dart_status"] = "corp_map_failed"
-        return
-    # 수집 대상: 어느 월말이든 시총이 DART_MIN_CAP_억 이상이었던 보통주(백테스트 유니버스 하한보다 넉넉하게). 호출 수를 줄이기 위함.
+def _dart_todo(first_year: int, now: datetime | None = None, need_asof: str | None = None,
+               include_failed: bool = False, age_rule: bool = True) -> list[tuple[int, str]]:
+    """(다시) 받아야 할 분기.
+      1) 수집 가능한데 캐시에 없는 분기
+      2) 잠정 분기(확정일 전에 받은 것) 가운데
+         - need_asof(편입 월말, YYYYMMDD)보다 먼저 받은 것 — 편입일 전날까지 접수된 보고서를 모두 보려면 편입일 이후에 받아야 한다
+         - 받은 지 하루(제출기한 3주 전까지는 7일)가 지난 것 — 보고서가 들어오는 철에는 날마다 새로 반영
+    최근 DART_RETRY_SEC 안에 실패한 분기는 건너뛴다(연속 재시도 방지) — include_failed=True 면 포함(준비 여부 판정용)."""
+    n = _naive(now)
+    out = []
+    for (y, q) in _quarters_available(first_year, n):
+        key = f"{y}{q}"
+        if not include_failed and time.time() - _dart_fail.get(key, 0) < DART_RETRY_SEC:
+            continue
+        meta = _dart_meta.get(key) or {}
+        if key not in _dart_raw:
+            out.append((y, q))
+            continue
+        f_at = str(meta.get("fetched_at") or "")
+        if len(f_at) != 8:                       # 받은 날을 모르는 옛 캐시 → 확정으로 간주
+            continue
+        _start, due, final = _q_times(y, q)
+        if f_at >= _ymd(final):                  # 확정
+            continue
+        if need_asof and f_at < need_asof:
+            out.append((y, q))
+            continue
+        if not age_rule:
+            continue
+        age = (n - datetime.strptime(f_at, "%Y%m%d")).days
+        interval = 1 if n >= due - timedelta(days=21) else 7
+        if age >= interval:
+            out.append((y, q))
+    return out
+
+
+def dart_codes() -> list[str]:
+    """DART 수집 대상: 어느 월말이든 시총이 DART_MIN_CAP_EOK(기본 300)억 이상이었던 보통주(백테스트 유니버스 하한보다 넉넉하게)."""
     min_cap = float(os.environ.get("DART_MIN_CAP_EOK", "300")) * 1e8
     with factors._lock:
         snaps = list(factors._snaps.values())
@@ -428,27 +559,61 @@ def ensure_dart(dates: list[str]) -> None:
         if "cap" in f.columns and "common" in f.columns:
             ok = (f["cap"] >= min_cap) & (f["common"] > 0)
             cand.update(str(t) for t in f.index[ok.to_numpy()])
-    codes = sorted(t for t in cand if t in _corp_map and t.endswith("0"))
+    return sorted(t for t in cand if t in _corp_map and t.endswith("0"))
+
+
+def ensure_dart(dates: list[str], need_asof: str | None = None) -> None:
+    """월말 목록이 필요로 하는 분기 재무를 (없거나 다시 받아야 하면) 받아 캐시."""
+    if not DART_KEY:
+        _state["dart_status"] = "no_key"
+        return
+    if not load_corp_map():
+        _state["dart_status"] = "corp_map_failed"
+        return
+    codes = dart_codes()
     _state["dart_companies"] = len(codes)
     if not codes:
         _state["dart_status"] = "no_tickers"
         return
     first_year = int(dates[0][:4]) if dates else _today().year - 1
-    periods = _quarters_available(first_year)
-    todo = [(y, q) for (y, q) in periods if f"{y}{q}" not in _dart_raw]
-    _state["dart_target"] = _state.get("dart_done", 0) + len(todo) * max(1, (len(codes) + 99) // 100)
-    _state["dart_eta_note"] = f"분기 {len(todo)}개 × 호출 {max(1, (len(codes) + 99) // 100)}회, 동시 {DART_WORKERS}개"
+    todo = _dart_todo(first_year, None, need_asof)
+    per_q = max(1, (len(codes) + 99) // 100)
+    _state["dart_target"] = _state.get("dart_done", 0) + len(todo) * per_q
+    _state["dart_eta_note"] = f"분기 {len(todo)}개 × 호출 {per_q}회, 동시 {DART_WORKERS}개"
+    if not todo:
+        _state["dart_status"] = "ready"
+        return
     _state["dart_status"] = "running"
+    changed = 0
     for i, (y, q) in enumerate(todo, 1):
-        df = fetch_dart_period(y, q, codes)
+        key = f"{y}{q}"
+        df, failed = fetch_dart_period(y, q, codes)
+        now = _today()
+        old = _dart_raw.get(key)
+        if failed > max(1, per_q // 10):         # 호출의 10% 넘게 실패 → 이번 수집분은 버린다(일부 회사가 통째로 빠질 수 있음)
+            _dart_fail[key] = time.time()
+            _state["last_error"] = f"DART {key}: 호출 {failed}/{per_q}회 실패 → 이번 수집분은 버리고 기존 자료 유지(10분 뒤 재시도)"
+            log.warning(_state["last_error"])
+            continue
+        if failed:
+            _state["last_error"] = f"DART {key}: 호출 {failed}/{per_q}회 실패(허용 범위) — 일부 회사가 빠졌을 수 있음"
+        if old is not None and len(old) >= 50 and len(df) < 0.9 * len(old):
+            _dart_fail[key] = time.time()
+            _state["last_error"] = f"DART {key}: 다시 받은 결과가 기존보다 적음({len(df)} < {len(old)}) → 기존 자료 유지"
+            log.warning(_state["last_error"])
+            continue
         with _lock:
-            _dart_raw[f"{y}{q}"] = df
-            _dart_meta[f"{y}{q}"] = {"n": int(len(df)), "fetched_at": _ymd(_today())}
+            _dart_raw[key] = df
+            _dart_meta[key] = {"n": int(len(df)), "fetched_at": _ymd(now), "fetched_ts": now.strftime("%Y-%m-%d %H:%M"),
+                               "provisional": bool(_naive(now) < _q_times(y, q)[2]), "failed_calls": int(failed)}
+        _dart_fail.pop(key, None)
+        changed += 1
+        _dart_cache.clear()
         _malloc_trim()
         if i % 4 == 0 and i < len(todo):
             save_cache()                      # 중간 저장: 재배포로 끊겨도 받은 분기는 복구됨
     _state["dart_status"] = "ready"
-    if todo:
+    if changed:
         save_cache()
 
 
@@ -526,7 +691,8 @@ def dart_panels(dates: list[str], tickers: list[str]) -> dict[str, pd.DataFrame]
         t = Q[k].reindex(cols)
         rc = t["rcept"].astype(str).where(t["rcept"].notna(), "99999999").to_numpy()
         rc = np.array([s if (len(s) == 8 and s.isdigit()) else "99999999" for s in rc])
-        avail = date_arr[:, None] >= rc[None, :]                      # (dates × tickers): 이 분기가 반영 가능한 월말
+        # (dates × tickers): 이 분기가 반영 가능한 월말 — 접수일 '다음 날'부터(접수일 당일은 장 마감 뒤 제출일 수 있음; v1.6 까지는 당일 포함)
+        avail = date_arr[:, None] > rc[None, :]
         hist_ni.append(t.get("ni3", pd.Series(np.nan, index=cols)))
         hist_op.append(t.get("op3", pd.Series(np.nan, index=cols)))
         ni_ttm = sum(s.reindex(cols).fillna(np.nan) for s in hist_ni[-4:]) if len(hist_ni) >= 4 else pd.Series(np.nan, index=cols)
@@ -572,6 +738,38 @@ def _sig_panels(P: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
 
 _sig_cache: dict[int, dict[str, pd.DataFrame]] = {}
 _dart_cache: dict[int, dict[str, pd.DataFrame]] = {}
+_short_cache: dict[int, pd.DataFrame] = {}
+
+
+def _get_short(P: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """공표 시차를 반영한 공매도 잔고 비중 패널(행=날짜, 열=티커). 월말이 아닌 최근 거래일 행은 직전 월말 값(1칸 ffill)."""
+    key = id(P["close"])
+    if key not in _short_cache:
+        _short_cache.clear()
+        idx, cols = P["close"].index, P["close"].columns
+        with _lock:
+            frames = {d: _short_l2[d] for d in sorted(_short_l2)}
+        if not frames:
+            _short_cache[key] = pd.DataFrame(np.nan, index=idx, columns=cols)
+        else:
+            keys = list(frames)
+            pos = {t: i for i, t in enumerate(cols)}
+            mat = np.full((len(keys), len(cols)), np.nan)
+            for r, d in enumerate(keys):
+                f = frames[d]
+                common = [t for t in f.index if t in pos]
+                if common:
+                    mat[r, [pos[t] for t in common]] = f.loc[common].to_numpy(dtype=float)
+            df = pd.DataFrame(mat, index=keys, columns=cols)
+            _short_cache[key] = df.reindex(idx.union(df.index)).sort_index().ffill(limit=1).reindex(idx)
+    return _short_cache[key]
+
+
+def clear_panel_caches() -> None:
+    """한 번의 계산이 끝나면 패널 캐시를 비운다(패널은 호출마다 새로 만들어져 재사용되지 않으므로 메모리만 차지)."""
+    _sig_cache.clear()
+    _dart_cache.clear()
+    _short_cache.clear()
 
 
 def _get_sig(P: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
@@ -664,12 +862,12 @@ def f_frgn_chg(P):
 
 
 def f_short_bal(P):
-    return _get_sig(P)["short_bal"]
+    return _get_short(P)
 
 
 def f_short_chg(P):
-    S = _get_sig(P)
-    return S["short_bal"] - S["short_bal"].shift(3)
+    sb = _get_short(P)
+    return sb - sb.shift(3)
 
 
 def f_epm(P):
@@ -704,6 +902,11 @@ def f_op_yield(P):
     return D["op_ttm"] / P["cap"].where(P["cap"] > 0)
 
 
+def f_bm_q(P):
+    D = _get_dart(P)
+    return D["equity"].where(D["equity"] > 0) / P["cap"].where(P["cap"] > 0)
+
+
 def f_sec_margin(P):
     S = _get_sig(P)
     opm = f_opm_chg(P)
@@ -734,8 +937,9 @@ def register_all() -> None:
     reg("flow20", True, "수급: (외국인+기관) 20거래일 순매수 / 시총", f_flow20)
     reg("flow60", True, "수급: 최근 3개월 (외국인+기관) 순매수 합 / 시총", f_flow60)
     reg("frgn_chg", True, "외국인 지분율 3개월 변화(%p)", f_frgn_chg)
-    reg("short_bal", False, "공매도 잔고 비중(%) (낮을수록 좋음)", f_short_bal)
-    reg("short_chg", False, "공매도 잔고 비중 3개월 변화(%p) (낮을수록 좋음)", f_short_chg)
+    reg("short_bal", False, "공매도 잔고 비중(%) — 월말 2거래일 전 잔고(공표 시차 반영) (낮을수록 좋음)", f_short_bal)
+    reg("short_chg", False, "공매도 잔고 비중 3개월 변화(%p) — 공표 시차 반영 (낮을수록 좋음)", f_short_chg)
+    reg("bm_q", True, "가치: 최근 분기 자본총계 / 시총 [DART] (KRX PBR 보다 최신 장부가)", f_bm_q)
     factors.register_group("earnings", ["epm", "sales_g", "opm_chg"])
     factors.register_group("quality2", ["roe_ttm", "agr"])
     factors.register_group("sector", ["sec_mom", "rs3", "sec_margin"])
@@ -750,9 +954,11 @@ def save_cache() -> bool:
     if cachestore is None:
         return False
     with _lock:
-        payload = {"version": 1, "sig": dict(_sig), "sig_meta": dict(_sig_meta), "sector_code": dict(_sector_code),
+        payload = {"version": 2, "sig": dict(_sig), "sig_meta": dict(_sig_meta), "sector_code": dict(_sector_code),
                    "sector_name": dict(_sector_name), "dart_raw": dict(_dart_raw), "dart_meta": dict(_dart_meta),
-                   "corp_map": dict(_corp_map), "saved_at": _today().strftime("%Y-%m-%d %H:%M:%S")}
+                   "corp_map": dict(_corp_map), "corp_map_at": _corp_map_at.get("ymd"),
+                   "short_l2": dict(_short_l2), "short_l2_meta": dict(_short_l2_meta),
+                   "saved_at": _today().strftime("%Y-%m-%d %H:%M:%S")}
     return cachestore.save(CACHE_NAME, payload)
 
 
@@ -776,9 +982,15 @@ def load_cache() -> int:
                 _dart_meta[k] = obj.get("dart_meta", {}).get(k, {})
         if obj.get("corp_map"):
             _corp_map = dict(obj["corp_map"])
+            _corp_map_at["ymd"] = obj.get("corp_map_at")
+        for d, ser in (obj.get("short_l2") or {}).items():          # v1.7 부터(없으면 서버가 백그라운드로 채움)
+            if isinstance(ser, pd.Series):
+                _short_l2[d] = ser
+        _short_l2_meta.update(obj.get("short_l2_meta") or {})
     if _dart_raw and DART_KEY:
         _state["dart_status"] = "ready"
-    log.info("signals 캐시 복구: 월말 %d개, DART 분기 %d개 (저장 %s)", len(_sig), len(_dart_raw), obj.get("saved_at"))
+    log.info("signals 캐시 복구: 월말 %d개, DART 분기 %d개, 공매도(T-%d) %d개 (저장 %s)", len(_sig), len(_dart_raw),
+             SHORT_LAG_DAYS, len(_short_l2), obj.get("saved_at"))
     return len(_sig)
 
 
@@ -796,6 +1008,35 @@ def ensure_signals(dates: list[str]) -> None:
         _sig_cache.clear()
     if todo:
         save_cache()
+
+
+def _short_lag_needed(dates: list[str]) -> list[str]:
+    """공표 시차 반영 공매도 잔고가 있어야 하는 월말(공시 시작 이후)."""
+    return [d for d in dates if d >= SHORT_DATA_FROM and _lag_date(d, SHORT_LAG_DAYS) >= SHORT_DATA_FROM]
+
+
+def ensure_short_lag(dates: list[str], retry_empty_sec: int = 6 * 3600) -> int:
+    """월말들의 '2거래일 전 공매도 잔고'를 (없는 달만) 받는다. v1.7 로 올린 뒤 처음 한 번은 기존 월말 전부(약 250회 호출)."""
+    need = _short_lag_needed(dates)
+    now = time.time()
+    todo = [d for d in need if d not in _short_l2
+            and now - float((_short_l2_meta.get(d) or {}).get("tried") or 0) > retry_empty_sec]
+    _state["short_lag_target"] = len(need)
+    _state["short_lag_done"] = len(need) - len([d for d in need if d not in _short_l2])
+    got = 0
+    for i, d in enumerate(todo, 1):
+        try:
+            if fetch_short_lag(d) > 0:
+                got += 1
+                _state["short_lag_done"] += 1
+        except Exception as e:  # noqa: BLE001
+            _state["last_error"] = f"공매도(T-{SHORT_LAG_DAYS}) {d}: {e}"
+            log.warning("공매도 잔고(T-%d) 수집 실패 %s: %s", SHORT_LAG_DAYS, d, e)
+        if i % 24 == 0 and got:
+            save_cache()                      # 중간 저장
+    if got:
+        save_cache()
+    return got
 
 
 def _wait_for_factors(max_wait_sec: int = 7200) -> list[str]:
@@ -837,9 +1078,10 @@ def prefetch(years: float | None = None) -> dict[str, Any]:
             else:
                 t = None
             ensure_signals(dates)
+            ensure_short_lag(dates)
             if t is not None:
                 t.join()
-            _dart_cache.clear()
+            clear_panel_caches()
         except Exception as e:  # noqa: BLE001
             _state["last_error"] = str(e)
             log.exception("signals prefetch 실패")
@@ -851,39 +1093,105 @@ def prefetch(years: float | None = None) -> dict[str, Any]:
     return cache_status()
 
 
-def refresh_recent() -> None:
-    """factors 에 새 월말이 생겼는데 신호가 없으면 그 달만 받는다(월초 자동 실행 대비)."""
+def _refresh_needs(need_asof: str | None = None) -> dict[str, Any]:
+    """지금 보충해야 할 것(빠른 점검, 네트워크 호출 없음)."""
     with factors._lock:
         dates = sorted(factors._snaps)
-    missing = [d for d in dates[-3:] if d not in _sig]
-    if missing:
+    if not dates:
+        return {"dates": dates, "sig": [], "short": [], "dart": []}
+    sig = [d for d in dates[-3:] if d not in _sig]
+    now = time.time()
+    short = [d for d in _short_lag_needed(dates) if d not in _short_l2
+             and now - float((_short_l2_meta.get(d) or {}).get("tried") or 0) > 6 * 3600]
+    dart = _dart_todo(int(dates[0][:4]), None, need_asof) if DART_KEY else []
+    return {"dates": dates, "sig": sig, "short": short, "dart": dart}
+
+
+def refresh_recent(need_asof: str | None = None) -> None:
+    """새 월말의 신호, 빠진 공매도(T−2) 잔고, (다시) 받아야 할 DART 분기를 보충한다(월초 자동 실행·실적 철 대비)."""
+    need = _refresh_needs(need_asof)
+    dates = need["dates"]
+    if not dates:
+        return
+    if need["sig"]:
         ensure_signals(dates)
-    if DART_KEY:
-        periods = _quarters_available(int(dates[0][:4])) if dates else []
-        if any(f"{y}{q}" not in _dart_raw for (y, q) in periods):
-            ensure_dart(dates)
-            _dart_cache.clear()
+    if need["short"]:
+        ensure_short_lag(dates)
+    if need["dart"]:
+        ensure_dart(dates, need_asof)
+    clear_panel_caches()
 
 
-def refresh_recent_async() -> None:
-    """도구 호출 시 백그라운드로 최근 월말 신호·분기 재무를 보충(응답을 막지 않음)."""
+def refresh_recent_async(need_asof: str | None = None) -> bool:
+    """도구 호출 시 백그라운드로 최근 월말 신호·분기 재무를 보충(응답을 막지 않음). 돌고 있으면 True."""
     if _state["running"]:
-        return
-    with factors._lock:
-        dates = sorted(factors._snaps)
-    need_sig = any(d not in _sig for d in dates[-2:]) if dates else False
-    need_dart = bool(DART_KEY and dates and any(f"{y}{q}" not in _dart_raw for (y, q) in _quarters_available(int(dates[0][:4]))))
-    if not (need_sig or need_dart):
-        return
+        return True
+    need = _refresh_needs(need_asof)
+    if not (need["sig"] or need["short"] or need["dart"]):
+        return False
 
     def _job():
         _state["running"] = True
+        _state["started_at"] = _today().strftime("%Y-%m-%d %H:%M")
         try:
-            refresh_recent()
+            refresh_recent(need_asof)
+        except Exception as e:  # noqa: BLE001
+            _state["last_error"] = f"refresh: {type(e).__name__}: {e}"
+            log.exception("signals refresh 실패")
         finally:
             _state["running"] = False
+            _state["finished_at"] = _today().strftime("%Y-%m-%d %H:%M")
 
     threading.Thread(target=_job, name="signals-refresh", daemon=True).start()
+    return True
+
+
+def paper_ready(asof: str, need_dart: bool = True, need_short: bool = True) -> dict[str, Any]:
+    """등록 전략이 월말 asof 에 편입할 종목을 정하는 데 필요한 자료가 준비됐는지. 빠진 것이 있으면 백그라운드 수집을 시작한다.
+    DART: 잠정 분기는 asof 이후에 받은 것이어야 한다(asof 전날까지 접수된 보고서를 모두 반영하기 위해)."""
+    missing: list[str] = []
+    with factors._lock:
+        fdates = [d for d in sorted(factors._snaps) if d <= asof]
+    if need_short:
+        # short_chg 는 3개월 전 잔고와의 차이 → 편입 월말과 그 3개월 전까지(최근 4개 월말)가 모두 있어야 한다
+        lack = [d for d in _short_lag_needed(fdates[-4:]) if d not in _short_l2]
+        if lack:
+            missing.append(f"공매도 잔고(T−{SHORT_LAG_DAYS}) {', '.join(lack)}")
+    if need_dart:
+        if not DART_KEY:
+            return {"ok": False, "fatal": True, "message": "DART_API_KEY 가 없어 이익 신호를 계산할 수 없습니다(Railway 변수 확인)."}
+        with factors._lock:
+            dates = sorted(factors._snaps)
+        todo = _dart_todo(int(dates[0][:4]), None, need_asof=asof, include_failed=True, age_rule=False) if dates else []
+        if todo:
+            missing.append("DART 분기 " + ", ".join(f"{y}{q}" for y, q in todo) + f" (편입일 {asof} 이후에 받은 자료 필요)")
+    if not missing:
+        return {"ok": True}
+    running = refresh_recent_async(need_asof=asof)
+    return {"ok": False, "missing": missing, "refresh_running": bool(running), "last_error": _state.get("last_error"),
+            "message": "편입에 필요한 자료를 받는 중입니다(DART 분기 하나에 약 6분, KRX 신호 약 30초). 몇 분 뒤 다시 실행하세요."}
+
+
+def readiness_warnings() -> list[str]:
+    """백테스트 결과에 붙일 경고(자료가 덜 모였을 때)."""
+    out: list[str] = []
+    with factors._lock:
+        dates = sorted(factors._snaps)
+    if not dates:
+        return out
+    miss_sig = [d for d in dates if d not in _sig]
+    if miss_sig:
+        out.append(f"업종·수급 신호가 없는 월말 {len(miss_sig)}개 — sector·flow 계열 결과는 수집이 끝난 뒤 다시 실행하세요")
+    need = _short_lag_needed(dates)
+    have = sum(1 for d in need if d in _short_l2)
+    if need and have < len(need):
+        out.append(f"공매도 잔고(T−{SHORT_LAG_DAYS}) 자료가 {have}/{len(need)}개 월말만 있음 — short_bal·short_chg·shortint 가 들어간 결과는 "
+                   "수집이 끝난 뒤(signals_cache_status 의 short_lag) 다시 실행하세요")
+    if DART_KEY:
+        missing_q = [f"{y}{q}" for (y, q) in _quarters_available(int(dates[0][:4])) if f"{y}{q}" not in _dart_raw]
+        if missing_q:
+            out.append(f"DART 분기 {len(missing_q)}개 미수집({missing_q[0]}…{missing_q[-1]}) — 이익 신호 결과는 수집이 끝난 뒤 다시 실행하세요")
+    return out
 
 
 def cache_status() -> dict[str, Any]:
@@ -892,28 +1200,47 @@ def cache_status() -> dict[str, Any]:
         metas = [_sig_meta[d] for d in sig_dates]
         dart_keys = sorted(_dart_raw)
         dart_n = {k: _dart_meta.get(k, {}).get("n") for k in dart_keys}
+        dart_meta = {k: dict(_dart_meta.get(k) or {}) for k in dart_keys}
+        short_dates = sorted(_short_l2)
     st = dict(_state)
+    with factors._lock:
+        f_dates = sorted(factors._snaps)
+    need_short = _short_lag_needed(f_dates)
+    provisional = [k for k in dart_keys if dart_meta[k].get("provisional")]
+    recent = {k: {"n": dart_meta[k].get("n"), "fetched": dart_meta[k].get("fetched_ts") or dart_meta[k].get("fetched_at"),
+                  "provisional": bool(dart_meta[k].get("provisional"))} for k in dart_keys[-3:]}
+    todo_now = [f"{y}{q}" for (y, q) in (_dart_todo(int(f_dates[0][:4])) if (DART_KEY and f_dates) else [])]
     return {"signal_month_ends": len(sig_dates), "earliest": sig_dates[0] if sig_dates else None, "latest": sig_dates[-1] if sig_dates else None,
             "coverage_avg": {"sector": int(np.mean([m["sector_n"] for m in metas])) if metas else 0,
                              "flow": int(np.mean([m["flow_n"] for m in metas])) if metas else 0,
                              "short": int(np.mean([m["short_n"] for m in metas])) if metas else 0,
                              "frgn_hold": int(np.mean([m["hold_n"] for m in metas])) if metas else 0},
+            "short_lag": {"lag_trading_days": SHORT_LAG_DAYS, "month_ends": len(short_dates), "needed": len(need_short),
+                          "complete": bool(need_short) and all(d in _short_l2 for d in need_short),
+                          "first": short_dates[0] if short_dates else None, "last": short_dates[-1] if short_dates else None,
+                          "last_balance_date": (_short_l2_meta.get(short_dates[-1]) or {}).get("date") if short_dates else None,
+                          "note": "KRX 공매도 잔고는 T+2 거래일에 공표 → 월말 신호는 2거래일 전 잔고 사용(short_bal·short_chg)"},
             "sectors_known": len(_sector_code),
             "dart": {"status": st.get("dart_status"), "key_set": bool(DART_KEY), "key_len": len(DART_KEY), "quarters": len(dart_keys),
                      "first": dart_keys[0] if dart_keys else None, "last": dart_keys[-1] if dart_keys else None,
                      "companies_per_quarter_avg": int(np.mean([v for v in dart_n.values() if v])) if any(dart_n.values()) else 0,
                      "corp_map": len(_corp_map), "companies_fetched": st.get("dart_companies"),
                      "calls_done": st.get("dart_done"), "calls_target": st.get("dart_target"),
+                     "provisional_quarters": provisional, "recent_quarters": recent, "to_fetch_now": todo_now,
                      "panel_compute_error": _dart_compute_error["error"], "last_error": st.get("last_error")},
             "prefetch": st, "process_rss_mb": _rss_mb(),
             "persist": cachestore.status(CACHE_NAME) if cachestore is not None else {"enabled": False},
             "factors_registered": [n for n in factors.ATOMIC_FACTORS if n in factors.EXTRA_FACTORS],
             "groups": {k: v for k, v in factors.GROUP_FACTORS.items() if k in ("earnings", "quality2", "sector", "flow", "shortint")},
-            "note": "factors 월말 수집이 끝난 뒤 시작. 월말당 KRX 9회(약 20~30초), DART 분기당 약 30회. "
-                    "신호가 없는 달은 해당 팩터가 NaN 으로 처리돼 그 달 유니버스에서 빠집니다."}
+            "note": "factors 월말 수집이 끝난 뒤 시작. 월말당 KRX 9회(약 20~30초), DART 분기당 약 29회(약 6분). "
+                    "신호가 없는 달은 해당 팩터가 NaN 으로 처리돼 그 달 유니버스에서 빠집니다. "
+                    "DART 는 분기말+20일부터 잠정 수집하고 제출기한+10일까지 하루 한 번 다시 받습니다."}
 
 
 register_all()
+factors.READINESS_HOOKS.append(readiness_warnings)
+factors.CLEANUP_HOOKS.append(clear_panel_caches)
+factors.PAPER_READY["fn"] = paper_ready
 try:
     load_cache()
 except Exception as _e:  # noqa: BLE001

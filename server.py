@@ -35,6 +35,32 @@ import screener            # 같은 폴더. 전종목 조건 스크리너
 import factors             # 같은 폴더. 학계식 팩터(횡단면 순위) 백테스트·스크리너 (월말 스냅샷 캐시)
 import signals             # 같은 폴더. 1단계 추가 신호(DART 재무·업종 모멘텀·수급·공매도) — factors 레지스트리에 팩터로 등록
 
+try:                       # 2단계: 매크로·신용 국면(FRED). 이 모듈이 실패해도 나머지 도구는 그대로 동작해야 한다.
+    import macro
+    _macro_err = None
+except Exception as _e:  # noqa: BLE001
+    macro = None
+    _macro_err = f"{type(_e).__name__}: {_e}"
+
+VERSION = "1.7"
+
+
+def _code_md5() -> dict[str, Any]:
+    """배포된 소스 파일의 md5 앞 8자 — 올린 파일이 그대로 반영됐는지 확인용(health·selftest 에 표시)."""
+    import hashlib
+    base = os.path.dirname(os.path.abspath(__file__))
+    out: dict[str, Any] = {}
+    for fn in ("server.py", "factors.py", "signals.py", "macro.py", "cachestore.py", "screener.py", "indicators.py"):
+        try:
+            with open(os.path.join(base, fn), "rb") as f:
+                out[fn] = hashlib.md5(f.read()).hexdigest()[:8]
+        except Exception:  # noqa: BLE001
+            out[fn] = None
+    return out
+
+
+CODE_MD5 = _code_md5()
+
 # MCP SDK 2.x 에서 FastMCP 가 MCPServer 로 이름이 바뀌었습니다.
 # 어느 버전이 깔려도 돌아가게 둘 다 시도합니다.
 try:
@@ -272,10 +298,14 @@ def health() -> dict[str, Any]:
     return {
         "ok": ok,
         "detail": detail,
+        "version": VERSION,
         "pykrx_version": getattr(__import__("pykrx"), "__version__", "unknown"),
         "server_time_kst": today_kst().strftime("%Y-%m-%d %H:%M:%S"),
         "railway": railway or None,
-        "env_keys_set": {k: bool(os.environ.get(k)) for k in ("MCP_TOKEN", "KRX_ID", "KRX_PW", "DART_API_KEY", "CACHE_DIR", "RAILWAY_VOLUME_MOUNT_PATH")},
+        "env_keys_set": {k: bool(os.environ.get(k)) for k in ("MCP_TOKEN", "KRX_ID", "KRX_PW", "DART_API_KEY", "GITHUB_TOKEN", "FRED_API_KEY",
+                                                              "CACHE_DIR", "RAILWAY_VOLUME_MOUNT_PATH")},
+        "modules": {"macro": macro is not None, "macro_error": _macro_err},
+        "code_md5": CODE_MD5,
         "source": "KRX via pykrx",
     }
 
@@ -777,7 +807,7 @@ def backtest_factors(factors_spec: str = "value,quality,lowvol,mom", min_cap_eok
                      top_pct: float = 10, top_n: int = 0, hold_months: int = 1, exclude_managed: bool = True,
                      min_price: float = 1000, include_single_factor_table: bool = True,
                      max_months_listed: int = 130, cost_pct: float = 0.5, delist_return_pct: float = -50.0,
-                     exclude_suspended: bool = True) -> dict[str, Any]:
+                     exclude_suspended: bool = True, split: str = "") -> dict[str, Any]:
     """학계식 팩터 백테스트: 매월 말 유니버스(보통주, 시총 min_cap_eok억↑) 전종목을 팩터 백분위 순위로 점수화해
     상위 top_pct%(또는 top_n 종목)를 동일가중 매수, hold_months 개월 보유(월말 리밸런싱), 다음 달 수익률을
     유니버스 동일가중 평균·종목별 시장 지수와 비교합니다. years 년(기본 10년 = 120개월).
@@ -794,6 +824,11 @@ def backtest_factors(factors_spec: str = "value,quality,lowvol,mom", min_cap_eok
     v1.4 계산 규칙: cost_pct = 왕복 거래비용(%)으로 월 교체율에 곱해 비용 후 지표 산출(기본 0.5). delist_return_pct = 다음 달
     스냅샷에서 사라진 종목(상장폐지·합병)의 그 달 수익률(기본 -50; 민감도는 0/-50/-90 비교). exclude_suspended = 월 거래량 0
     (거래정지) 종목 편입 제외. hold_months>1 이면 t 는 Newey-West 보정값(excess_t_stat_plain 이 단순 t).
+
+    v1.7: split = "short_ban"(공매도 전면 허용/부분 허용/전면 금지 구간별) 또는 "macro"(편입 시점의 매크로 국면 안정/불안별)로
+    초과수익을 나눠 split 항목에 보고. portfolio.dividend = 배당을 더한 참고치(판정 미포함). warnings = 자료가 덜 모였을 때의 경고.
+    추가 신호 팩터(signals_cache_status 참고): epm sales_g opm_chg agr roe_ttm op_yield bm_q sec_margin sec_mom rs3 flow20 flow60
+    frgn_chg short_bal short_chg, 그룹 earnings quality2 sector flow shortint.
     결과는 과거 통계이며 매매 권유가 아닙니다."""
     signals.refresh_recent_async()
     return factors.run_backtest(factors=factors_spec, min_cap_억=min_cap_eok, years=float(years), top_pct=float(top_pct),
@@ -801,7 +836,33 @@ def backtest_factors(factors_spec: str = "value,quality,lowvol,mom", min_cap_eok
                                 min_price=float(min_price), include_single_factor_table=bool(include_single_factor_table),
                                 max_months_listed=int(max_months_listed), cost_pct=float(cost_pct),
                                 delist_return_pct=(None if delist_return_pct is None else float(delist_return_pct)),
-                                exclude_suspended=bool(exclude_suspended))
+                                exclude_suspended=bool(exclude_suspended), split=str(split or ""))
+
+
+@mcp.tool()
+def backtest_walkforward(min_cap_eok: float = 1000, years: float = 10, top_pct: float = 10, top_n: int = 0, hold_months: int = 3,
+                         train_months: int = 36, min_train: int = 24, factors_spec: str = "all", split: str = "",
+                         max_months_listed: int = 0) -> dict[str, Any]:
+    """워크포워드 가중치 종합점수 백테스트 — 신호 가중치를 '그 시점까지의 과거 자료'로만 정합니다.
+    편입 월말마다 팩터별 직전 train_months(기본 36)개월 평균 IC(실현된 것만, 최소 min_train 개월)를 부호 있는 가중치로 써서
+    점수 = Σ 가중치 × (팩터 백분위 − 0.5) → 상위 top_pct%(또는 top_n 종목)를 hold_months 개월 보유. 과거에 거꾸로 맞은 신호는
+    음(−)의 가중치로 자동 반영됩니다. factors_spec="all" 이면 사전 등록한 원자 팩터 25개(LEDGER.md), 아니면 쉼표로 지정.
+    결과 형식은 backtest_factors 와 같고(criteria_academic·portfolio·deciles·by_year…), walkforward.weights 에 최신·평균 가중치와
+    부호 안정성이 붙습니다. 학습 기간만큼 평가 구간이 짧아집니다(10년 자료 → 약 8년). split 은 backtest_factors 와 동일.
+    사전 등록 설정(기본값 그대로)은 한 번만 실행해 LEDGER.md 에 기록하세요. 과거 통계이며 매매 권유가 아닙니다."""
+    signals.refresh_recent_async()
+    return factors.run_walkforward(factors=factors_spec, min_cap_억=float(min_cap_eok), years=float(years), top_pct=float(top_pct),
+                                   top_n=int(top_n), hold_months=int(hold_months), train_months=int(train_months),
+                                   min_train=int(min_train), max_months_listed=int(max_months_listed), split=str(split or ""))
+
+
+@mcp.tool()
+def screen_walkforward(min_cap_eok: float = 1000, top_n: int = 30, factors_spec: str = "all") -> dict[str, Any]:
+    """최근 거래일 기준 워크포워드 종합점수 상위 종목. 종목마다 점수 백분위와 함께 top_drivers(점수를 끌어올린 신호의 순위·가중치)와
+    drags(깎은 신호)를 보여 줍니다. weights 는 현재 가중치(직전 36개월 평균 IC, Σ|w|=100, 부호 유지).
+    사실 데이터 집계이며 매매 권유가 아닙니다 — 이 점수의 과거 성과는 backtest_walkforward 로 확인하세요."""
+    signals.refresh_recent_async()
+    return factors.run_screen_wf(factors=factors_spec, min_cap_억=float(min_cap_eok), top_n=int(top_n))
 
 
 @mcp.tool()
@@ -818,7 +879,8 @@ def cache_persist_status() -> dict[str, Any]:
     재시작 때 KRX/DART 재수집 없이 몇 초~수십 초 만에 복구합니다. github.can_upload 가 false 면 저장은 안 되고 복구만 시도합니다."""
     import cachestore
     return {"store": cachestore.status(), "screener": cachestore.status("screener"), "factors": cachestore.status("factors"),
-            "signals": cachestore.status("signals"),
+            "signals": cachestore.status("signals"), "macro": cachestore.status("macro"),
+            "paper_ledger": cachestore.status("paper_ledger"),
             "env": {"CACHE_DIR": os.environ.get("CACHE_DIR"), "RAILWAY_VOLUME_MOUNT_PATH": os.environ.get("RAILWAY_VOLUME_MOUNT_PATH"),
                     "GITHUB_CACHE_REPO": os.environ.get("GITHUB_CACHE_REPO", "leelookmm133-max/pykrx-mcp"),
                     "GITHUB_TOKEN_set": bool(os.environ.get("GITHUB_TOKEN"))},
@@ -830,21 +892,37 @@ def cache_persist_status() -> dict[str, Any]:
 
 @mcp.tool()
 def signals_cache_status() -> dict[str, Any]:
-    """추가 신호 캐시 상태: 월말 수·커버리지(업종/수급/공매도/외국인), DART 분기 수·회사 수·키 설정 여부, 등록된 팩터 이름과 그룹.
-    backtest_factors / screen_factors 의 factors_spec 에 이 팩터 이름(epm, sales_g, opm_chg, agr, roe_ttm, op_yield, sec_margin,
+    """추가 신호 캐시 상태: 월말 수·커버리지(업종/수급/공매도/외국인), short_lag(공표 시차를 반영한 공매도 잔고 수집 현황),
+    DART 분기 수·회사 수·잠정 분기·지금 받을 분기·키 설정 여부, 등록된 팩터 이름과 그룹.
+    backtest_factors / screen_factors 의 factors_spec 에 이 팩터 이름(epm, sales_g, opm_chg, agr, roe_ttm, op_yield, bm_q, sec_margin,
     sec_mom, rs3, flow20, flow60, frgn_chg, short_bal, short_chg)과 그룹(earnings, quality2, sector, flow, shortint)을 쓸 수 있습니다."""
     return signals.cache_status()
 
 
 @mcp.tool()
-def paper_test(show_all_cohorts: bool = False) -> dict[str, Any]:
-    """표본 외(paper) 검증 보고 — 2026-11-07 에 사전 등록한 규칙 '저PBR 상위 30종목·12개월 보유(시총 1,000억↑ 보통주)'를
-    그대로 적용합니다. 규칙 파라미터는 받지 않습니다(바꾸면 표본 외 검증이 아님).
+def paper_test(show_all_cohorts: bool = False, strategy: str = "lowpbr", holdings_limit: int = 30) -> dict[str, Any]:
+    """표본 외(paper) 검증 보고 — 사전 등록한 규칙을 그대로 적용합니다. 규칙 파라미터는 받지 않습니다(바꾸면 표본 외 검증이 아님).
+    strategy:
+      "lowpbr"(기본) 2026-11-07 등록 '저PBR 상위 30종목·12개월 보유' — 판정 2028-10
+      "esb"          2026-11-12 등록 '이익+공매도+저PBR 상위 10%·3개월 보유' — 첫 편입 2026-11-30, 판정 2028-11
+      "earn"         2026-11-12 등록 '이익 신호 단독 상위 10%·3개월 보유' — 첫 편입 2026-11-30, 판정 2028-11
+      "all"          세 전략 요약
     돌려주는 것: registration(등록된 규칙·판정 규칙·표본 내 참고치), status(진행 n/24개월 또는 판정), oos_summary(표본 외 월평균
-    초과수익·적중률·t·누적 수익률 vs 유니버스·지수), oos_monthly, cohorts(이번 달 편입 30종목 포함; show_all_cohorts=True 면 모든
-    코호트의 종목), in_sample_reproduction(표본 내 구간 재계산 — 등록 참고치와 거의 같아야 함).
-    직전 완료 달의 월말 데이터가 없으면 먼저 받아옵니다(약 10초). 과거·현재 통계이며 매매 권유가 아닙니다."""
-    return factors.run_paper_test(show_all_cohorts=bool(show_all_cohorts))
+    초과수익·적중률·t·누적 수익률 vs 유니버스·지수), oos_monthly, cohorts(이번 달 편입 종목; esb·earn 은 점수 상위 holdings_limit 개
+    + 전체 코드, show_all_cohorts=True 면 모든 코호트), in_sample_reproduction(표본 내 구간 재계산), ledger(편입 종목 고정 장부 상태),
+    esb·earn 은 secondary_top30(상위 30종목 참고 버전)도.
+    편입 종목은 처음 계산할 때 장부에 고정됩니다. 직전 완료 달의 월말 데이터가 없으면 먼저 받아오고(약 10초), esb·earn 은 DART·공매도
+    자료가 편입일 기준으로 준비되지 않았으면 status="preparing"(백그라운드 수집 시작, 5~10분 뒤 다시 호출).
+    과거·현재 통계이며 매매 권유가 아닙니다."""
+    return factors.run_paper_test(show_all_cohorts=bool(show_all_cohorts), strategy=str(strategy or "lowpbr"),
+                                  holdings_limit=int(holdings_limit))
+
+
+@mcp.tool()
+def paper_ledger() -> dict[str, Any]:
+    """표본 외 검증의 편입 종목 고정 장부 요약: 전략별 편입 월말·종목 수·hash·고정 시각. 종목 목록 자체는 paper_test 의 cohorts 와
+    GitHub 저장소 'cache' 릴리스의 paper_ledger.json 에 있습니다. hash 가 월간 보고의 값과 다르면 기록이 바뀐 것입니다."""
+    return factors.ledger_status()
 
 
 @mcp.tool()
@@ -857,6 +935,125 @@ def screen_factors(factors_spec: str = "value,quality,lowvol,mom", min_cap_eok: 
     signals.refresh_recent_async()
     return factors.run_screen(factors=factors_spec, min_cap_억=min_cap_eok, top_n=int(top_n),
                               exclude_managed=bool(exclude_managed), min_price=float(min_price))
+
+
+# ─────────────────────────────────────────────────────────────
+# 2단계: 매크로·신용 국면 (FRED) — macro.py
+# ─────────────────────────────────────────────────────────────
+@mcp.tool()
+def macro_status() -> dict[str, Any]:
+    """매크로(FRED) 자료 수집 상태: 계열별 관측 수·기간·최신값·받은 시각·출처(API/CSV), FRED_API_KEY 설정 여부, 오류.
+    계열: BAA10Y(신용 스프레드) BAMLH0A0HYM2(하이일드, 최근 3년) T10Y2Y DGS10 DGS2 VIXCLS DEXKOUS(원/달러) DTWEXBGS DCOILWTICO."""
+    if macro is None:
+        return {"ok": False, "error": f"macro 모듈을 불러오지 못했습니다: {_macro_err}"}
+    macro.refresh_async()
+    return macro.status()
+
+
+@mcp.tool()
+def macro_regime(months: int = 24, min_cap_eok: float = 1000) -> dict[str, Any]:
+    """현재 매크로·신용 지표와 '시장 불안정도 점수'(stress), 국면(안정/불안), 최근 months 개월 추이, 국면별 과거 통계.
+    stress = z(신용 스프레드 3개월 변화) · z(VIX ÷ 12개월 평균) · z(원/달러 3개월 변화율) 의 평균(z 는 그 시점까지 최근 60개월 기준),
+    stress > 0 이면 '불안'. dashboard = 금리·스프레드·VIX·환율·유가의 최신값과 1·3개월 변화·5년 백분위.
+    base_rates = 편입 시점 국면별 '다음 1·3개월' 유니버스 동일가중·KOSPI 평균 수익률과 사전 등록 가설 M1 검정.
+    전략별 국면 성과는 backtest_factors(split="macro"). 과거 통계이며 매매 권유가 아닙니다."""
+    if macro is None:
+        return {"ok": False, "error": f"macro 모듈을 불러오지 못했습니다: {_macro_err}"}
+    return macro.regime_report(months=int(months), min_cap_eok=float(min_cap_eok))
+
+
+# 현행 방법으로 다시 계산한 표본 내 수치의 기준값 — 배포가 바뀌어도 같아야 한다(다르면 자료나 계산이 달라진 것)
+SELFTEST_EXPECT: dict[str, dict[str, float]] = {"lowpbr": {"excess_pp": 0.60, "t": 1.99}}
+
+
+@mcp.tool()
+def selftest() -> dict[str, Any]:
+    """배포 뒤 자가 점검(약 10~40초). 캐시(월말·신호·공매도 T−2·DART)·저장소·등록 규칙 지문·표본 내 수치 재현·편입 종목 장부·
+    매크로 자료·메모리를 한 번에 확인해 checks 목록(ok: true/false/null=보류)으로 돌려줍니다. ok=false 면 실패한 항목이 있는 것."""
+    checks: list[dict[str, Any]] = []
+
+    def add(name: str, ok: Any, detail: Any) -> None:
+        checks.append({"check": name, "ok": None if ok is None else bool(ok), "detail": detail})
+
+    rss0 = screener._rss_mb()
+    try:
+        fs = factors.cache_status()
+        need = int(round(factors.DEFAULT_YEARS * 12)) + factors.WARMUP_MONTHS
+        n = fs["cached_month_ends"]
+        add("월말 스냅샷", n >= need and not fs["prefetch"]["running"],
+            f"{n}/{need}개, 최신 {fs['latest']}, 수집 중={fs['prefetch']['running']}, 오류={fs['prefetch'].get('last_error')}")
+        y, m = factors._last_complete_month()
+        me = factors._month_end.get((y, m))
+        add("직전 완료 달의 월말", me is not None and me in factors._snaps, f"{y}-{m:02d} → {me}")
+        rq = fs["return_source"]
+        add("월간 수익률 출처", rq["close_fallback"] == 0 and rq["hybrid"] <= 2,
+            f"KRX 수정주가 {rq['krx_adjusted']} · 하이브리드 {rq['hybrid']} · 종가 폴백 {rq['close_fallback']} · 기준가 일치 {rq['base_match_pct_avg']}%")
+    except Exception as e:  # noqa: BLE001
+        add("월말 스냅샷", False, f"{type(e).__name__}: {e}")
+    try:
+        ss = signals.cache_status()
+        add("월말 신호(업종·수급)", ss["signal_month_ends"] >= fs["cached_month_ends"] and not ss["prefetch"]["running"],
+            f"{ss['signal_month_ends']}개, 최신 {ss['latest']}, 수집 중={ss['prefetch']['running']}")
+        sl = ss["short_lag"]
+        add("공매도 잔고(T−2)", sl["complete"], f"{sl['month_ends']}/{sl['needed']}개 월말, 최근 잔고 기준일 {sl['last_balance_date']}")
+        d = ss["dart"]
+        add("DART 분기 재무", d["status"] == "ready" and not d["to_fetch_now"],
+            f"상태 {d['status']}, 분기 {d['quarters']}개({d['first']}~{d['last']}), 잠정 {d['provisional_quarters']}, "
+            f"지금 받을 분기 {d['to_fetch_now']}, 오류 {d['last_error']}")
+    except Exception as e:  # noqa: BLE001
+        add("신호·DART", False, f"{type(e).__name__}: {e}")
+    try:
+        import cachestore
+        cs = cachestore.status()
+        add("캐시 저장소", bool(cs["github"]["can_upload"] or cs["local_dir"]),
+            f"GitHub 업로드 가능={cs['github']['can_upload']}, 로컬={cs['local_dir']}, 오류={cs['github']['last_error']}")
+    except Exception as e:  # noqa: BLE001
+        add("캐시 저장소", False, f"{type(e).__name__}: {e}")
+    for sid, reg in factors.REGISTRATIONS.items():
+        fp = factors._reg_fingerprint(reg)
+        add(f"등록 규칙 지문({sid})", fp == factors.REG_FINGERPRINTS.get(sid), f"{fp} (등록 시 {factors.REG_FINGERPRINTS.get(sid)})")
+    for sid in factors.REGISTRATIONS:
+        try:
+            r = factors.run_paper_test(strategy=sid, holdings_limit=1)
+            if not r.get("ok"):
+                add(f"paper_test({sid})", None if r.get("status") == "preparing" else False, r.get("message") or r.get("error"))
+                continue
+            ins = r["in_sample_reproduction"]
+            exp = SELFTEST_EXPECT.get(sid)
+            ok = None
+            if exp:
+                ok = (ins.get("excess_vs_universe_pp") is not None and abs(ins["excess_vs_universe_pp"] - exp["excess_pp"]) <= 0.03
+                      and ins.get("excess_t_stat") is not None and abs(ins["excess_t_stat"] - exp["t"]) <= 0.1)
+            add(f"표본 내 재현({sid})", ok,
+                f"초과 {ins.get('excess_vs_universe_pp')}%p · t {ins.get('excess_t_stat')} · {ins.get('months')}개월"
+                + (f" (기준 {exp['excess_pp']}%p · t {exp['t']})" if exp else " (기준값은 v1.7 첫 실행 뒤 LEDGER 에 기록)"))
+            led = r["ledger"]
+            add(f"편입 종목 장부({sid})", not led.get("recompute_mismatch") and led.get("persisted") is not False and not led.get("unavailable"),
+                f"고정 코호트 {led['frozen_cohorts']}개, 이번에 고정 {led['newly_frozen']}, 저장됨={led['persisted']}, "
+                f"재계산 불일치={led['recompute_mismatch']}" + (f", 장부 읽기 실패: {led['unavailable']}" if led.get("unavailable") else ""))
+        except Exception as e:  # noqa: BLE001
+            add(f"paper_test({sid})", False, f"{type(e).__name__}: {e}")
+    if macro is not None:
+        try:
+            ms = macro.status()
+            add("매크로(FRED)", ms["have"] == ms["target"],
+                f"{ms['have']}/{ms['target']} 계열, 키 {'있음' if ms['key_set'] else '없음(공개 CSV 사용)'}, "
+                f"마지막 갱신 {ms['refresh']['last_refresh']}, 오류 {ms['refresh']['last_error']}")
+        except Exception as e:  # noqa: BLE001
+            add("매크로(FRED)", False, f"{type(e).__name__}: {e}")
+    else:
+        add("매크로 모듈", False, _macro_err)
+    rss1 = screener._rss_mb()
+    add("메모리", rss1 is None or rss1 < 750, f"점검 전 {rss0}MB → 후 {rss1}MB")
+    failed = [c for c in checks if c["ok"] is False]
+    pending = [c for c in checks if c["ok"] is None]
+    return {"ok": not failed, "version": VERSION,
+            "summary": f"통과 {len(checks) - len(failed) - len(pending)} · 실패 {len(failed)} · 보류 {len(pending)}",
+            "failed": [c["check"] for c in failed], "pending": [c["check"] for c in pending], "checks": checks,
+            "server_time_kst": today_kst().strftime("%Y-%m-%d %H:%M:%S"),
+            "git_commit": (os.environ.get("RAILWAY_GIT_COMMIT_SHA") or "")[:7] or None, "code_md5": CODE_MD5,
+            "note": "보류(null)는 자료 수집 중이거나 기준값이 아직 없는 항목. 배포 직후에는 공매도(T−2) 백필(10~15분)과 DART 최신 분기 수집(약 6분)이 "
+                    "끝난 뒤 다시 실행하세요."}
 
 
 @mcp.tool()

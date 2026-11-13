@@ -128,6 +128,42 @@ def register_group(name: str, members: list[str]) -> None:
 
 CRITERIA = {"excess_pp": 0.3, "t": 2.0, "hit_pct": 55.0, "mono_rho": 0.7, "ic_ref": 0.02}
 
+# 다른 모듈(signals.py·macro.py)이 꽂는 훅 (v1.7)
+READINESS_HOOKS: list[Any] = []                 # fn() -> list[str] : 자료가 덜 모였을 때 결과에 붙일 경고
+CLEANUP_HOOKS: list[Any] = []                   # fn() -> None      : 계산이 끝난 뒤 임시 패널 캐시 비우기
+PAPER_READY: dict[str, Any] = {"fn": None}      # fn(asof, need_dart, need_short) -> {"ok": bool, ...} : 등록 전략 편입 자료 준비 확인
+SPLITS: dict[str, dict[str, Any]] = {}          # 이름 -> {"desc", "fn"(월말 목록 -> {월말: 라벨}), "by": "return"|"formation"}
+
+
+def register_split(name: str, desc: str, fn, by: str = "formation") -> None:
+    """구간 분할 등록. by="return": 수익률 월의 월말 날짜로 라벨, "formation": 그 수익률의 직전 월말(편입 시점)로 라벨."""
+    SPLITS[name.lower()] = {"desc": desc, "fn": fn, "by": by}
+
+
+def _warnings() -> list[str]:
+    out: list[str] = []
+    for fn in READINESS_HOOKS:
+        try:
+            out.extend(fn() or [])
+        except Exception as e:  # noqa: BLE001
+            log.warning("readiness hook 실패: %s", e)
+    return out
+
+
+def _cleanup() -> None:
+    """계산에 쓴 큰 임시 배열을 OS 에 돌려준다(Railway 메모리 한도 대비)."""
+    for fn in CLEANUP_HOOKS:
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            log.warning("cleanup hook 실패: %s", e)
+    try:
+        import gc
+        gc.collect()
+    except Exception:  # noqa: BLE001
+        pass
+    _malloc_trim()
+
 
 # ────────────────────────────────────────────────────────────
 # 날짜 유틸
@@ -785,8 +821,19 @@ def _parse_factors(spec: Any) -> list[str]:
     return out
 
 
-def raw_factors(P: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
-    """원시 팩터 값 패널(행=월말, 열=티커). 방향은 ATOMIC_FACTORS 참고."""
+def _atoms_of(names: list[str]) -> list[str]:
+    """팩터 이름(그룹 포함) → 구성 원자 팩터 목록(중복 없이)."""
+    out: list[str] = []
+    for n in names:
+        for a in (GROUP_FACTORS[n] if n in GROUP_FACTORS else [n]):
+            if a not in out:
+                out.append(a)
+    return out
+
+
+def raw_factors(P: dict[str, pd.DataFrame], only: Any = None) -> dict[str, pd.DataFrame]:
+    """원시 팩터 값 패널(행=월말, 열=티커). 방향은 ATOMIC_FACTORS 참고.
+    only: 원자 팩터 이름 모음을 주면 추가 신호(EXTRA_FACTORS)는 그 안에 든 것만 계산한다(DART·업종 패널 계산 절약)."""
     close, cap, ret = P["close"], P["cap"], P["ret"]
     pbr, eps, bps, div = P["pbr"], P["eps"], P["bps"], P["div"]
     logret = np.log1p(ret.where(ret > -0.999))
@@ -802,7 +849,10 @@ def raw_factors(P: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     F["high52"] = adj / adj.rolling(12, min_periods=9).max()
     F["size"] = cap
     F["lowturn"] = P["tval_m"] / cap.where(cap > 0)
+    need = None if only is None else set(only)
     for name, fn in EXTRA_FACTORS.items():
+        if need is not None and name not in need:
+            continue
         try:
             out = fn(P)
             F[name] = out.reindex(index=close.index, columns=close.columns).astype(float)
@@ -1163,11 +1213,88 @@ DEFAULT_COST_PCT = 0.5          # 왕복 거래비용(%): 수수료·거래세·
 DEFAULT_DELIST_PCT = -50.0      # 다음 달 스냅샷에서 사라진 종목(상장폐지·합병)에 부여하는 그 달 수익률(%)
 
 
+# 공매도 규제 구간(한국): 전면 금지 2020-03-16~2021-05-02, 부분 허용(KOSPI200·KOSDAQ150 만) 2021-05-03~2023-11-05,
+# 전면 금지 2023-11-06~2025-03-30, 그 밖은 전면 허용. 공매도 잔고 신호(short_bal·short_chg)는 금지 구간에 정보가 줄어든다.
+SHORT_BAN_PERIODS = [("20200316", "20210502", "전면 금지"), ("20210503", "20231105", "부분 허용"), ("20231106", "20250330", "전면 금지")]
+
+
+def _short_ban_label(ymd: str) -> str:
+    for a, b, lab in SHORT_BAN_PERIODS:
+        if a <= ymd <= b:
+            return lab
+    return "전면 허용"
+
+
+register_split("short_ban", "공매도 규제 구간(수익률 월의 월말 날짜 기준): 전면 허용 / 부분 허용(2021-05~2023-10) / 전면 금지(2020-03~2021-04, 2023-11~2025-03)",
+               lambda dates: {d: _short_ban_label(d) for d in dates}, by="return")
+
+
+def _split_stats(port: pd.Series, uni: pd.Series, dates: list[str], name: str, nw_lags: int = 0) -> dict[str, Any]:
+    """월간 초과수익을 구간 라벨별로 나눠 요약. 라벨이 둘이면 평균 차이의 t(Welch)도 계산."""
+    sp = SPLITS.get(name)
+    if sp is None:
+        return {"error": f"알 수 없는 split '{name}'. 가능: {', '.join(SPLITS) or '(없음)'}"}
+    try:
+        labels = sp["fn"](dates) or {}
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"split '{name}' 계산 실패: {type(e).__name__}: {e}"}
+    uni = uni.reindex(port.index)
+    ok = port.notna() & uni.notna()
+    ex = (port - uni)[ok]
+    pos = {d: i for i, d in enumerate(dates)}
+    groups: dict[str, list[str]] = {}
+    for m in ex.index:
+        i = pos.get(m)
+        if i is None:
+            continue
+        key = m if sp["by"] == "return" else (dates[i - 1] if i >= 1 else None)
+        lab = labels.get(key) if key is not None else None
+        groups.setdefault(str(lab) if lab is not None else "(라벨 없음)", []).append(m)
+    out_groups: dict[str, Any] = {}
+    for lab, months in groups.items():
+        x = ex[months]
+        out_groups[lab] = {"months": int(len(x)), "port_avg_month_pct": round(float(port[months].mean()) * 100, 2),
+                           "universe_avg_month_pct": round(float(uni[months].mean()) * 100, 2),
+                           "excess_pp": round(float(x.mean()) * 100, 2), "t": _tstat_nw(x, nw_lags),
+                           "hit_rate_pct": round(float((x > 0).mean()) * 100, 1)}
+    out: dict[str, Any] = {"name": name, "desc": sp["desc"], "label_by": "수익률 월" if sp["by"] == "return" else "편입 시점(직전 월말)",
+                           "groups": out_groups}
+    real = [g for g in groups if g != "(라벨 없음)"]
+    if len(real) == 2:
+        a, b = ex[groups[real[0]]], ex[groups[real[1]]]
+        if len(a) >= 6 and len(b) >= 6:
+            se = math.sqrt(float(a.var(ddof=1)) / len(a) + float(b.var(ddof=1)) / len(b))
+            out["difference"] = {"a": real[0], "b": real[1], "a_minus_b_pp": round(float(a.mean() - b.mean()) * 100, 2),
+                                 "t_welch": round(float(a.mean() - b.mean()) / se, 2) if se > 0 else None}
+    out["note"] = ("구간별 t 는 구간 안의 달만 이어 붙여 계산한 근사값(보유기간이 겹치면 Newey-West). 구간 수가 적어 표본이 작으니 "
+                   "방향 확인용으로만 볼 것")
+    return out
+
+
 def run_backtest(factors: Any = DEFAULT_FACTORS, min_cap_억: float = 1000, years: float = 10, top_pct: float = 10,
                  top_n: int = 0, hold_months: int = 1, exclude_managed: bool = True, min_price: float = 1000,
                  include_single_factor_table: bool = True, max_months_listed: int = 130,
                  cost_pct: float = DEFAULT_COST_PCT, delist_return_pct: float | None = DEFAULT_DELIST_PCT,
-                 exclude_suspended: bool = True) -> dict[str, Any]:
+                 exclude_suspended: bool = True, split: str = "", _raw: bool = False, _score_fn: Any = None) -> dict[str, Any]:
+    """백테스트 본체(_run_backtest_impl)를 돌리고, 끝나면 임시 메모리를 정리한다."""
+    try:
+        return _run_backtest_impl(factors=factors, min_cap_억=min_cap_억, years=years, top_pct=top_pct, top_n=top_n,
+                                  hold_months=hold_months, exclude_managed=exclude_managed, min_price=min_price,
+                                  include_single_factor_table=include_single_factor_table, max_months_listed=max_months_listed,
+                                  cost_pct=cost_pct, delist_return_pct=delist_return_pct, exclude_suspended=exclude_suspended,
+                                  split=split, _raw=_raw, _score_fn=_score_fn)
+    finally:
+        _cleanup()
+
+
+def _run_backtest_impl(factors: Any = DEFAULT_FACTORS, min_cap_억: float = 1000, years: float = 10, top_pct: float = 10,
+                       top_n: int = 0, hold_months: int = 1, exclude_managed: bool = True, min_price: float = 1000,
+                       include_single_factor_table: bool = True, max_months_listed: int = 130,
+                       cost_pct: float = DEFAULT_COST_PCT, delist_return_pct: float | None = DEFAULT_DELIST_PCT,
+                       exclude_suspended: bool = True, split: str = "", _raw: bool = False,
+                       _score_fn: Any = None) -> dict[str, Any]:
+    """_score_fn(P, mask_f, fwd, dates) -> (점수 백분위 패널, 설명 dict): 주면 팩터 순위 평균 대신 이 점수로 포트폴리오를 만든다
+    (워크포워드 가중치 종합점수용). 평가·통계 부분은 똑같이 쓴다."""
     t0 = time.time()
     try:
         names = _parse_factors(factors)
@@ -1204,7 +1331,7 @@ def run_backtest(factors: Any = DEFAULT_FACTORS, min_cap_억: float = 1000, year
     mask_f.loc[~row_ok, :] = False
     van_uni = (vanished & mask_f).sum(axis=1)     # 형성월별 유니버스 내 '다음 달 사라진' 종목 수
 
-    F = raw_factors(P)
+    F = raw_factors(P, only=None if include_single_factor_table else _atoms_of(names)) if _score_fn is None else {}
     kospi_m, kosdaq_m = _index_monthly(dates)
     kflag = (P["kosdaq"] > 0).to_numpy()
 
@@ -1226,8 +1353,12 @@ def run_backtest(factors: Any = DEFAULT_FACTORS, min_cap_억: float = 1000, year
         return pd.concat(parts, axis=1).mean(axis=1), pd.concat(iparts, axis=1).mean(axis=1)
 
     # ── 복합 점수
-    R = factor_ranks(F, names, mask_f)
-    comp = composite_rank(R, names, mask_f)
+    score_info: dict[str, Any] | None = None
+    if _score_fn is not None:
+        comp, score_info = _score_fn(P, mask_f, fwd, dates)
+    else:
+        R = factor_ranks(F, names, mask_f)
+        comp = composite_rank(R, names, mask_f)
     k = max(1, int(hold_months))
     if int(top_n) > 0:
         sel = ((-comp).rank(axis=1, method="first") <= int(top_n)) & mask_f
@@ -1243,6 +1374,17 @@ def run_backtest(factors: Any = DEFAULT_FACTORS, min_cap_억: float = 1000, year
     st = _series_stats(port, uni_series, port_idx, nw_lags=nw, cost=cost_series)
     st["avg_monthly_turnover_pct"] = round(float(turn.dropna().mean()) * 100, 1) if turn.notna().any() else None
     st["delisted_in_portfolio_total"] = int((vanished & sel).to_numpy().sum())
+    # 배당 포함 참고치: KRX 가 편입 월말에 공표한 배당수익률(최근 사업연도 주당배당/주가, %)의 1/12 를 월 배당으로 가정
+    if "div" in P and bool(P["div"].notna().any().any()) and st.get("months"):
+        divm = P["div"].clip(lower=0, upper=30).fillna(0.0) / 100.0 / 12.0
+        pdv = pd.concat([_to_return_month(divm.where(sel).mean(axis=1), dates, j) for j in range(1, k + 1)], axis=1).mean(axis=1)
+        udv = _to_return_month(divm.where(mask_f).mean(axis=1), dates, 1)
+        okd = port.notna() & uni_series.reindex(port.index).notna()
+        if bool(okd.any()):
+            pd_m, ud_m = float(pdv.reindex(port.index)[okd].mean()), float(udv.reindex(port.index)[okd].mean())
+            st["dividend"] = {"port_div_yield_pct": round(pd_m * 12 * 100, 2), "universe_div_yield_pct": round(ud_m * 12 * 100, 2),
+                              "excess_incl_div_pp": round(st["excess_vs_universe_pp"] + (pd_m - ud_m) * 100, 2),
+                              "note": "참고(판정 미포함): 편입 월말의 KRX 배당수익률을 12로 나눠 월 배당으로 더한 근사. 수익률·판정 기준은 배당 제외"}
     deciles = _decile_table(comp, fwd, uni_ret, mask_f)
     crit = _criteria(st, [d.get("avg_month_pct") for d in deciles["rows"]] if deciles["rows"] else None)
     ic_stats = _ic_summary(_ic_series(comp, fwd, mask_f))
@@ -1302,15 +1444,24 @@ def run_backtest(factors: Any = DEFAULT_FACTORS, min_cap_억: float = 1000, year
         "monthly_columns": ["수익률월", "보유종목수", "포트_pct", "유니버스_pct", "지수_pct", "초과_pp"],
         "monthly": monthly[-int(max_months_listed):] if max_months_listed else [],
     }
-    if include_single_factor_table:
+    if split:
+        out["split"] = _split_stats(port, uni_series, dates, str(split).strip().lower(), nw)
+    if score_info is not None:
+        out["_score_info"] = score_info
+    if include_single_factor_table and _score_fn is None:
         out["single_factors"] = _single_factor_table(F, fwd, uni_ret, mask_f, dates)
+    warn = _warnings()
+    if warn:
+        out["warnings"] = warn
+    if _raw:                                   # 내부용(macro 등): 월간 시리즈 원본
+        out["_series"] = {"port": port, "uni": uni_series, "idx": port_idx, "dates": dates, "nw": nw}
     out["data_quality"] = _data_quality(dates)
     out["caveats"] = [
         "월간 수익률은 KRX 전종목등락률(수정주가)로 액면분할·무상증자 등을 보정. 기준가 검증에 실패한 달은 종가 기반(상장주식수 변동 보정)으로 대체 — data_quality 참고",
         "다음 달 스냅샷에서 사라진 종목(상장폐지·합병·거래정지 후 폐지)은 그 달 수익률을 delist_return_pct 로 간주(사유 구분 불가 — 합병은 손실이 아닐 수 있고 부실 폐지는 더 클 수 있음). 민감도는 0 / -50 / -90 으로 비교할 것",
         "PER·PBR·EPS·BPS·배당은 KRX 가 해당 월말에 공표한 값(최근 사업보고서 기준) → 미래 정보 없음. 적자·미공표 EPS 는 0 으로 들어옴",
         "저변동성은 월간 수익률 12개 기준(학계는 일간 기준도 사용). 회전율은 월간 거래대금/시총",
-        "월말 종가 매수·다음 월말 종가 매도, 동일가중. 비용은 '왕복 cost_pct × 월 교체율'로 근사(호가 영향·세금 변동 미반영). 수익률은 배당 제외(지수도 동일)",
+        "월말 종가 매수·다음 월말 종가 매도, 동일가중. 비용은 '왕복 cost_pct × 월 교체율'로 근사(호가 영향·세금 변동 미반영). 수익률은 배당 제외(지수도 동일) — 배당을 더한 참고치는 portfolio.dividend",
         "보유기간이 1개월을 넘으면 월간 수익률이 겹쳐 자기상관이 생기므로 t 는 Newey-West 보정값",
         "표본이 10년이어도 시장 국면은 몇 개뿐 → t-통계량과 전·후반 일관성을 함께 볼 것",
     ]
@@ -1359,6 +1510,14 @@ def _latest_trading_snapshot() -> tuple[str, pd.DataFrame, dict[str, str]] | Non
 
 def run_screen(factors: Any = DEFAULT_FACTORS, min_cap_억: float = 1000, top_n: int = 30, exclude_managed: bool = True,
                min_price: float = 1000) -> dict[str, Any]:
+    try:
+        return _run_screen_impl(factors=factors, min_cap_억=min_cap_억, top_n=top_n, exclude_managed=exclude_managed, min_price=min_price)
+    finally:
+        _cleanup()
+
+
+def _run_screen_impl(factors: Any = DEFAULT_FACTORS, min_cap_억: float = 1000, top_n: int = 30, exclude_managed: bool = True,
+                     min_price: float = 1000) -> dict[str, Any]:
     t0 = time.time()
     try:
         names_f = _parse_factors(factors)
@@ -1380,7 +1539,7 @@ def run_screen(factors: Any = DEFAULT_FACTORS, min_cap_억: float = 1000, top_n:
     hist = [d for d in have if d < ymd][-WARMUP_MONTHS:]
     P = _panels(hist, extra=snap, extra_date=ymd)
     mask = _universe_mask(P, float(min_cap_억) * 1e8, exclude_managed, float(min_price))
-    F = raw_factors(P)
+    F = raw_factors(P, only=_atoms_of(names_f))
     R = factor_ranks(F, names_f, mask)
     comp = composite_rank(R, names_f, mask)
     last = comp.index[-1]
@@ -1426,6 +1585,243 @@ def run_screen(factors: Any = DEFAULT_FACTORS, min_cap_억: float = 1000, top_n:
             "elapsed_sec": round(time.time() - t0, 1),
             "note": "사실 데이터 집계이며 매매 권유가 아닙니다. 백테스트(backtest_factors)에서 기준을 통과한 팩터 조합만 쓰세요.",
             "source": "KRX via pykrx"}
+
+
+def market_series(min_cap_억: float = 1000, years: float = DEFAULT_YEARS) -> dict[str, Any] | None:
+    """국면 분석용 시장 시리즈: 유니버스 동일가중 월간 수익률(인덱스=수익률 월말, 백테스트의 유니버스와 같은 정의)과
+    KOSPI·KOSDAQ 월간 수익률(인덱스=월말). 월말 자료가 모자라면 None."""
+    need = int(round(float(years) * 12)) + WARMUP_MONTHS
+    with _lock:
+        have = sorted(_snaps)
+    dates = have[-need:] if len(have) >= need else have
+    if len(dates) < WARMUP_MONTHS + 6:
+        return None
+    P = _panels(dates)
+    mask = _universe_mask(P, float(min_cap_억) * 1e8, True, 1000.0, True)
+    ret, _van = _apply_delisting(P, DEFAULT_DELIST_PCT)
+    fwd = ret.shift(-1)
+    mask_f = mask & fwd.notna()
+    row_ok = np.zeros(len(dates), dtype=bool)
+    row_ok[WARMUP_MONTHS - 1:-1] = True
+    mask_f.loc[~row_ok, :] = False
+    uni = _to_return_month(fwd.where(mask_f).mean(axis=1), dates, 1)
+    kospi_m, kosdaq_m = _index_monthly(dates)
+    return {"dates": dates, "uni": uni, "kospi": kospi_m, "kosdaq": kosdaq_m}
+
+
+# ────────────────────────────────────────────────────────────
+# 워크포워드 가중치 종합점수 (v1.7) — 신호 가중치를 '그 시점까지의 과거 자료'로만 정한다
+#
+#   매 편입 월말 t 마다: 팩터별로 직전 train_months 개월의 월별 IC(순위와 다음 달 수익률의 스피어만 상관, t 시점에 이미
+#   실현된 것만)를 평균해 가중치로 쓴다. 가중치는 부호가 있다 — 과거에 거꾸로 맞은 신호(한국의 수급·업종 내 상대강도 등)는
+#   음(−)의 가중치로 자동 반영된다. 점수 = Σ 가중치 × (팩터 백분위 − 0.5) → 유니버스 백분위 → 상위 포트폴리오.
+#   어떤 신호가 통하는지를 결과를 본 뒤에 사람이 고르지 않으므로, 이 방식의 백테스트는 매달 '그 시점에 할 수 있었던 선택'만 담는다.
+#   설정(팩터 목록·36개월·최소 24개월·상위 10%·3개월 보유)은 실행 전에 LEDGER.md 에 고정했다.
+# ────────────────────────────────────────────────────────────
+WF_TRAIN_MONTHS = 36
+WF_MIN_TRAIN = 24
+# 사전 등록 목록(원자 팩터 25개). 그룹은 구성 팩터가 이미 들어 있어 쓰지 않는다.
+WF_REGISTERED_FACTORS = ["bm", "ep", "dy", "roe", "mom", "rev", "lowvol", "high52", "size", "lowturn",
+                         "epm", "sales_g", "opm_chg", "agr", "roe_ttm", "op_yield", "sec_margin", "sec_mom", "rs3",
+                         "flow20", "flow60", "frgn_chg", "short_bal", "short_chg", "bm_q"]
+
+
+def _wf_names(spec: Any = None) -> list[str]:
+    if spec is None or str(spec).strip().lower() in ("", "all", "wf"):
+        return [n for n in WF_REGISTERED_FACTORS if n in ATOMIC_FACTORS]
+    return _atoms_of(_parse_factors(spec))
+
+
+def _wf_scores(P: dict[str, pd.DataFrame], mask_rank: pd.DataFrame, mask_ic: pd.DataFrame, fwd: pd.DataFrame, names: list[str],
+               train: int = WF_TRAIN_MONTHS, min_train: int = WF_MIN_TRAIN, drop_last_ic: bool = False,
+               keep_last_ranks: bool = False) -> dict[str, Any]:
+    """워크포워드 점수. 반환 dict: comp(유니버스 백분위 패널), weights(행=월말, 열=팩터; 정규화 전 평균 IC), ic(월별 IC),
+    last_ranks(keep_last_ranks 일 때 마지막 행의 팩터별 순위), coverage(마지막 행 기준 점수 계산 종목 수).
+    메모리 피크를 낮추려고 팩터를 하나씩 순위 매겨 IC 를 구하고(1차), 가중치를 만든 뒤 다시 하나씩 순위 매겨 점수에 더한다(2차)."""
+    F = raw_factors(P, only=names)
+    idx, cols = P["close"].index, P["close"].columns
+    ics: dict[str, pd.Series] = {}
+    for n in names:                                               # 1차: 월별 IC
+        r = _pct_rank(F[n], ATOMIC_FACTORS[n][0], mask_rank)
+        ics[n] = _ic_series(r, fwd, mask_ic)
+        del r
+    ic_df = pd.DataFrame(ics).reindex(idx)
+    if drop_last_ic and len(ic_df) >= 2:
+        ic_df.iloc[-2] = np.nan                                   # 스크리너: 마지막 월말의 '다음 달'은 아직 끝나지 않은 달
+    w = ic_df.shift(1).rolling(int(train), min_periods=int(min_train)).mean()   # t 행: t-1 까지 실현된 IC 의 평균
+    w_np = w.to_numpy(dtype=float)
+    num = np.zeros((len(idx), len(cols)))
+    den = np.zeros((len(idx), len(cols)))
+    tot = np.nansum(np.abs(w_np), axis=1)                         # 행별 Σ|w|
+    last_ranks: dict[str, pd.Series] = {}
+    for j, n in enumerate(names):                                 # 2차: 점수 누적
+        r = _pct_rank(F[n], ATOMIC_FACTORS[n][0], mask_rank).to_numpy(dtype=float)
+        wj = np.nan_to_num(w_np[:, j], nan=0.0)[:, None]
+        have = ~np.isnan(r)
+        num += np.where(have, wj * (r - 0.5), 0.0)
+        den += np.where(have, np.abs(wj), 0.0)
+        if keep_last_ranks:
+            last_ranks[n] = pd.Series(r[-1], index=cols)
+        del r
+    with np.errstate(invalid="ignore", divide="ignore"):
+        cover = den / np.where(tot > 0, tot, np.nan)[:, None]
+        score = np.where((cover >= 0.5) & (den > 0), num / den, np.nan)
+    score_df = pd.DataFrame(score, index=idx, columns=cols)
+    comp = score_df.where(mask_rank).rank(axis=1, pct=True, method="average")
+    del F
+    return {"comp": comp, "weights": w, "ic": ic_df, "last_ranks": last_ranks, "score": score_df if keep_last_ranks else None}
+
+
+def _wf_weight_summary(w: pd.DataFrame, names: list[str], rows: list[str]) -> dict[str, Any]:
+    """가중치 요약: 최신 가중치(Σ|w|=100 으로 정규화, 부호 유지), 기간 평균, 부호가 양(+)이었던 달의 비율."""
+    ww = w.loc[[d for d in rows if d in w.index], names].dropna(how="all")
+    if ww.empty:
+        return {}
+    norm = ww.div(ww.abs().sum(axis=1).replace(0, np.nan), axis=0) * 100
+    last = norm.iloc[-1]
+    latest = {n: round(float(last[n]), 1) for n in last.abs().sort_values(ascending=False).index if not pd.isna(last[n])}
+    avg = {n: round(float(norm[n].mean()), 1) for n in names if norm[n].notna().any()}
+    pos = {n: round(float((ww[n] > 0).mean()) * 100, 0) for n in names if ww[n].notna().any()}
+    return {"as_of": ww.index[-1], "latest_pct": latest, "average_pct": avg, "positive_months_pct": pos,
+            "note": "가중치 = 직전 36개월 평균 IC(부호 유지)를 Σ|w|=100 으로 정규화한 값. 음수는 '높을수록 불리했다'는 뜻(역방향으로 반영). "
+                    "팩터의 '좋은 방향'(예: short_bal 은 낮을수록 좋음)은 이미 순위에 반영돼 있으므로, 음수는 그 통념과 반대였다는 의미"}
+
+
+def run_walkforward(factors: Any = "all", min_cap_억: float = 1000, years: float = 10, top_pct: float = 10, top_n: int = 0,
+                    hold_months: int = 3, train_months: int = WF_TRAIN_MONTHS, min_train: int = WF_MIN_TRAIN,
+                    exclude_managed: bool = True, min_price: float = 1000, max_months_listed: int = 0,
+                    cost_pct: float = DEFAULT_COST_PCT, delist_return_pct: float | None = DEFAULT_DELIST_PCT,
+                    split: str = "", _raw: bool = False) -> dict[str, Any]:
+    """워크포워드 가중치 종합점수 백테스트. 평가(초과수익·t·적중률·10분위·비용)는 backtest_factors 와 같은 엔진."""
+    try:
+        names = _wf_names(factors)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    if len(names) < 2:
+        return {"ok": False, "error": "워크포워드에는 원자 팩터가 2개 이상 필요합니다."}
+    train, mn = max(6, int(train_months)), max(3, min(int(min_train), int(train_months)))
+    box: dict[str, Any] = {}
+
+    def _fn(P, mask_f, fwd, dates):
+        res = _wf_scores(P, mask_f, mask_f, fwd, names, train, mn)
+        box["weights"] = res["weights"]
+        valid = [d for d in dates if d in res["weights"].index and bool(res["weights"].loc[d].notna().any())]
+        box["valid_rows"] = valid
+        return res["comp"], {"names": names}
+
+    try:
+        out = _run_backtest_impl(factors="bm", min_cap_억=min_cap_억, years=years, top_pct=top_pct, top_n=top_n, hold_months=hold_months,
+                                 exclude_managed=exclude_managed, min_price=min_price, include_single_factor_table=False,
+                                 max_months_listed=max_months_listed, cost_pct=cost_pct, delist_return_pct=delist_return_pct,
+                                 exclude_suspended=True, split=split, _raw=_raw, _score_fn=_fn)
+        if not out.get("ok"):
+            return out
+        out.pop("_score_info", None)
+        valid = box.get("valid_rows") or []
+        w = box.get("weights")
+        out["method"]["방식"] = ("워크포워드 가중치 종합점수: 편입 월말마다 팩터별 직전 "
+                               f"{train}개월 평균 IC(그 시점까지 실현된 것만, 최소 {mn}개월)를 부호 있는 가중치로 써서 "
+                               "점수 = Σ 가중치 × (팩터 백분위 − 0.5). 평가 방식은 backtest_factors 와 동일")
+        out["method"]["팩터"] = {n: ATOMIC_FACTORS[n][1] for n in names}
+        out["method"]["복합점수"] = "가중치 절댓값 합의 절반 이상에 해당하는 팩터 값이 있는 종목만 점수 계산 → 유니버스 백분위(100 = 최상위)"
+        if valid:
+            out["period"]["formation_from"] = valid[0]
+            out["period"]["note"] = (f"가중치 학습에 {mn}~{train}개월이 필요해 평가 구간이 짧아집니다(편입 {valid[0]} ~ {out['period'].get('formation_to')}). "
+                                     "앞부분은 학습에만 쓰였습니다.")
+        out["walkforward"] = {"train_months": train, "min_train": mn, "n_factors": len(names),
+                              "weights": _wf_weight_summary(w, names, valid) if w is not None else {}}
+        out["caveats"] = list(out.get("caveats", [])) + [
+            "워크포워드: 가중치는 과거 IC 로만 정하므로 '어떤 신호를 쓸지'에 대한 사후 선택은 없지만, 팩터 후보 목록(25개)·학습 창(36개월)·"
+            "가중 방식(평균 IC)은 사람이 정한 것 — 실행 전에 LEDGER.md 에 고정",
+            "평가 구간이 약 8년으로 짧아 t 가 낮게 나오기 쉽다. 표본 내 고정 조합(backtest_factors) 결과와 구간이 달라 직접 비교는 주의"]
+        return out
+    finally:
+        _cleanup()
+
+
+def run_screen_wf(factors: Any = "all", min_cap_억: float = 1000, top_n: int = 30, exclude_managed: bool = True, min_price: float = 1000,
+                  train_months: int = WF_TRAIN_MONTHS, min_train: int = WF_MIN_TRAIN) -> dict[str, Any]:
+    """최근 거래일 기준 워크포워드 종합점수 상위 종목 + 종목별 기여 신호."""
+    t0 = time.time()
+    try:
+        try:
+            names = _wf_names(factors)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        with _lock:
+            have = sorted(_snaps)
+        need = WARMUP_MONTHS + int(min_train) + 2
+        if len(have) < need:
+            st = dict(_state)
+            if not st["running"] and st.get("finished_target", 0) < need:
+                prefetch(DEFAULT_YEARS)
+            return {"ok": False, "status": "preparing", "cached_month_ends": len(have),
+                    "message": f"워크포워드 가중치 계산에 월말 {need}개 이상이 필요합니다(현재 {len(have)}개). 잠시 후 다시 실행하세요."}
+        live = _latest_trading_snapshot()
+        if live is None:
+            return {"ok": False, "error": "최근 거래일 시세를 받지 못했습니다(KRX 응답 없음)."}
+        ymd, snap, names_map = live
+        hist = [d for d in have if d < ymd]
+        is_month_end = ymd in have
+        P = _panels(hist, extra=snap, extra_date=ymd)
+        dates = list(P["close"].index)
+        mask = _universe_mask(P, float(min_cap_억) * 1e8, exclude_managed, float(min_price))
+        ret, _van = _apply_delisting(P, DEFAULT_DELIST_PCT)
+        fwd = ret.shift(-1)
+        mask_ic = mask & fwd.notna()
+        row_ok = np.zeros(len(dates), dtype=bool)
+        row_ok[WARMUP_MONTHS - 1:-1] = True
+        mask_ic.loc[~row_ok, :] = False
+        res = _wf_scores(P, mask, mask_ic, fwd, names, int(train_months), int(min_train), drop_last_ic=not is_month_end,
+                         keep_last_ranks=True)
+        comp, w = res["comp"], res["weights"]
+        last = dates[-1]
+        wl = w.loc[last]
+        if not bool(wl.notna().any()):
+            return {"ok": False, "error": "가중치를 계산할 만큼의 과거 IC 가 없습니다(신호 수집이 끝났는지 signals_cache_status 확인)."}
+        row = comp.loc[last].dropna().sort_values(ascending=False)
+        wn = wl / wl.abs().sum() * 100
+        fallback = _names_latest[1] if _names_latest else {}
+        L = {c: P[c].loc[last] for c in ("close", "cap", "kosdaq", "pbr", "per", "div", "ret")}
+
+        def _v(sr: pd.Series, t: str, nd: int = 2, scale: float = 1.0):
+            x = sr.get(t, np.nan)
+            return None if pd.isna(x) else round(float(x) * scale, nd)
+
+        rows = []
+        for t in row.index[: int(top_n)]:
+            contrib = []
+            for n in names:
+                rk = res["last_ranks"][n].get(t, np.nan)
+                if pd.isna(rk) or pd.isna(wn.get(n, np.nan)):
+                    continue
+                contrib.append((float(wn[n]) * (float(rk) - 0.5), n, float(rk)))
+            contrib.sort(reverse=True)
+            rows.append({"code": t, "name": names_map.get(t) or fallback.get(t, t),
+                         "market": "KOSDAQ" if L["kosdaq"].get(t, 0) > 0 else "KOSPI",
+                         "close": _v(L["close"], t, 0), "cap_억": _v(L["cap"], t, 0, 1e-8),
+                         "score_pct": round(float(row[t]) * 100, 1),
+                         "top_drivers": [{"factor": n, "rank_pct": round(rk * 100, 1), "weight_pct": round(float(wn[n]), 1)} for c, n, rk in contrib[:4] if c > 0],
+                         "drags": [{"factor": n, "rank_pct": round(rk * 100, 1), "weight_pct": round(float(wn[n]), 1)} for c, n, rk in contrib[::-1][:2] if c < 0],
+                         "PBR": _v(L["pbr"], t), "PER": _v(L["per"], t, 1), "DIV_pct": _v(L["div"], t), "ret_1m_pct": _v(L["ret"], t, 1, 100)})
+        out = {"ok": True, "as_of": f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}",
+               "method": {"방식": f"워크포워드 가중치 종합점수(직전 {int(train_months)}개월 평균 IC, 부호 유지). 가중치는 직전 월말까지 실현된 수익률로만 계산",
+                          "유니버스": f"보통주(우선주·스팩·코넥스 제외){', 관리·환기종목 제외' if exclude_managed else ''}, "
+                                      f"시총 {float(min_cap_억):g}억 이상, 주가 {float(min_price):g}원 이상",
+                          "읽는 법": "top_drivers = 이 종목 점수를 끌어올린 신호(순위 백분위·가중치), drags = 깎은 신호. "
+                                    "가중치가 음수인 신호는 순위가 낮을수록 점수에 유리"},
+               "universe_size": int(mask.loc[last].sum()), "scored_count": int(len(row)),
+               "weights": _wf_weight_summary(w, names, [last]).get("latest_pct"),
+               "top": rows, "elapsed_sec": round(time.time() - t0, 1),
+               "note": "사실 데이터 집계이며 매매 권유가 아닙니다. 이 점수의 표본 내 성과는 backtest_walkforward 로 확인하세요. "
+                       "수급·공매도 신호는 직전 월말 기준, DART 는 조회일 전날까지 접수분.",
+               "source": "KRX via pykrx + DART"}
+        warn = _warnings()
+        if warn:
+            out["warnings"] = warn
+        return out
+    finally:
+        _cleanup()
 
 
 # ────────────────────────────────────────────────────────────
@@ -1527,16 +1923,305 @@ def _rows_summary(rows: list[list[Any]], nw_lags: int = 0, month_cost: float = 0
     return out
 
 
-def run_paper_test(show_all_cohorts: bool = False) -> dict[str, Any]:
-    """사전 등록된 규칙(REGISTRATION)대로 표본 외 코호트를 계산해 보고한다. 규칙 파라미터는 받지 않는다."""
-    t0 = time.time()
-    reg = REGISTRATION
+# ────────────────────────────────────────────────────────────
+# 표본 외 등록 2·3 (2026-11-12 등록, 사용자 결정 "둘 다 등록") — 아래 규칙·파라미터도 수정하지 않습니다.
+#
+#   1단계(DART 재무·수급·공매도 신호) 표본 내 검증에서 미리 정해 둔 조합 6개 중 earnings+shortint+bm 상위 10% 만 5/5 를 통과했고
+#   (ESB), 이익 신호 단독은 표에서 고른 뒤 한 번만 돌려 5/5 였다(EARN — 사후 선택이므로 표본 내 수치는 낙관적). 둘 다 규칙을
+#   고정하고 등록 뒤 첫 월말(2026-11-30)부터 24개월(수익률월 2026-12 ~ 2028-11)의 표본 외 성과로 판정한다. 근거는 LEDGER.md.
+#   판정 규칙은 저PBR 등록과 같다. 편입 종목은 처음 계산할 때 장부(paper_ledger)에 고정해, 나중에 자료가 정정돼도 바뀌지 않는다.
+# ────────────────────────────────────────────────────────────
+_DATA_TIMING = ("편입일 종가 시점에 공표돼 있던 자료만 사용: DART 는 접수일이 편입일보다 앞선 보고서(분기 3개월 실적의 전년 동분기 대비), "
+                "공매도 잔고는 편입일 2거래일 전 잔고(KRX 공표 시차), PBR 은 KRX 가 편입일에 공표한 값")
+_COMMON_RULE = {
+    "universe": REGISTRATION["rule"]["universe"] + ", 그 달 거래량 0(거래정지) 제외",
+    "formation": "매월 마지막 거래일 종가 기준으로 편입, 동일가중. 처음 계산한 편입 종목을 장부(paper_ledger)에 고정",
+    "holding": "3개월 보유 후 교체. 매월 새 코호트가 생겨 최대 3개 코호트를 동시에 보유(코호트 안에서는 월간 동일가중 재조정 가정)",
+    "benchmark": REGISTRATION["rule"]["benchmark"],
+    "costs": "판정은 비용 전 수치. 왕복 0.5% × 실제 교체율을 뺀 비용 후 지표를 함께 표시. 사라진 종목(상장폐지·합병)은 그 달 −50% 간주",
+    "secondary": "같은 점수의 상위 30종목 버전을 참고용으로 함께 기록(판정에는 쓰지 않음)",
+}
+REG_ESB: dict[str, Any] = {
+    "id": "esb",
+    "name": "이익+공매도+저PBR 상위 10% · 3개월 보유 (표본 외 검증)",
+    "registered_on": "2026-11-12",
+    "rule": {
+        "signal": "earnings(epm·sales_g·opm_chg 백분위 순위 평균) · shortint(short_bal·short_chg 순위 평균, 낮을수록 좋음) · bm(1/PBR) "
+                  "세 순위의 평균(셋 중 둘 이상 있는 종목만) → 유니버스 상위 10%",
+        "data_timing": _DATA_TIMING, **_COMMON_RULE,
+    },
+    "params": {"factors": "earnings,shortint,bm", "top_pct": 10, "top_n": 0, "hold_months": 3, "min_cap_eok": 1000, "min_price": 1000,
+               "exclude_managed": True},
+    "oos_first_formation": "20261130",      # 등록 뒤 첫 월말. 2026-10-30 형성 코호트는 표본 내·외 어디에도 넣지 않는다
+    "oos_first_return_month": "2026-12",
+    "verdict_month": "2028-11",             # 24개월(2026-12 ~ 2028-11)
+    "verdict_months": 24,
+    "verdict_rule": REGISTRATION["verdict_rule"],
+    "in_sample_reference": {"period": "형성 2016-10 ~ 2026-09 (수익률월 120개, 표본 내) — 등록 근거, v1.6 자료 정의",
+                            "excess_pp": 0.46, "t_nw": 2.23, "hit_pct": 58.3, "first_half_pp": 0.38, "second_half_pp": 0.54,
+                            "net_excess_pp": 0.36, "cagr_pct": 7.5, "universe_cagr_pct": 1.4, "max_drawdown_pct": -38.8,
+                            "excess_vs_index_pp": -0.15, "criteria_passed": "5/5 (사전 등록 6개 검정 중 유일)",
+                            "top30": {"excess_pp": 0.46, "t_nw": 1.75, "hit_pct": 55.0},
+                            "note": "v1.7 의 시점 보정(공매도 T−2, 공시 접수 다음 날 반영) 뒤 수치는 in_sample_reproduction 에 매번 재계산"},
+    "in_sample_window": ("20161031", "20260930"),
+    "in_sample_last_return": "20261030",
+    "needs": {"dart": True, "short": True},
+    "amendments": [],
+}
+REG_EARN: dict[str, Any] = {
+    "id": "earn",
+    "name": "이익 신호 단독 상위 10% · 3개월 보유 (표본 외 검증)",
+    "registered_on": "2026-11-12",
+    "rule": {
+        "signal": "earnings = epm((당분기 3개월 영업이익 − 전년 동분기)/시총) · sales_g(3개월 매출 전년 동분기 대비) · opm_chg(영업이익률 변화) "
+                  "세 백분위 순위의 평균(셋 중 둘 이상 있는 종목만) → 유니버스 상위 10%",
+        "data_timing": "편입일 종가 시점에 공표돼 있던 자료만 사용: DART 접수일이 편입일보다 앞선 보고서(분기 3개월 실적의 전년 동분기 대비)",
+        **_COMMON_RULE,
+    },
+    "params": {"factors": "earnings", "top_pct": 10, "top_n": 0, "hold_months": 3, "min_cap_eok": 1000, "min_price": 1000,
+               "exclude_managed": True},
+    "oos_first_formation": "20261130",
+    "oos_first_return_month": "2026-12",
+    "verdict_month": "2028-11",
+    "verdict_months": 24,
+    "verdict_rule": REGISTRATION["verdict_rule"],
+    "in_sample_reference": {"period": "형성 2016-10 ~ 2026-09 (수익률월 120개, 표본 내) — 등록 근거, v1.6 자료 정의",
+                            "excess_pp": 0.56, "t_nw": 3.02, "hit_pct": 63.3, "first_half_pp": 0.69, "second_half_pp": 0.43,
+                            "net_excess_pp": 0.47, "cagr_pct": 7.5, "universe_cagr_pct": 1.4, "max_drawdown_pct": -39.3,
+                            "excess_vs_index_pp": 0.28, "criteria_passed": "5/5 — 단, 단독 팩터 표(29개)에서 고른 뒤 실행한 것이라 낙관적",
+                            "top30": {"excess_pp": 0.40, "t_nw": 1.33, "hit_pct": 53.3},
+                            "note": "v1.7 의 시점 보정(공시 접수 다음 날 반영) 뒤 수치는 in_sample_reproduction 에 매번 재계산"},
+    "in_sample_window": ("20161031", "20260930"),
+    "in_sample_last_return": "20261030",
+    "needs": {"dart": True, "short": False},
+    "amendments": [],
+}
+REGISTRATION.setdefault("id", "lowpbr")
+REGISTRATIONS: dict[str, dict[str, Any]] = {"lowpbr": REGISTRATION, "esb": REG_ESB, "earn": REG_EARN}
+
+
+def _reg_fingerprint(reg: dict[str, Any]) -> str:
+    """등록 규칙의 지문(sha256 앞 16자). 규칙·파라미터·판정 기준이 한 글자라도 바뀌면 달라진다 → selftest 가 확인."""
+    import hashlib
+    import json
+    core = {k: reg.get(k) for k in ("rule", "params", "oos_first_formation", "verdict_month", "verdict_rule", "registered_on")}
+    try:                                       # 그룹 팩터의 구성(예: earnings = epm·sales_g·opm_chg)도 규칙의 일부
+        names = _parse_factors(reg["params"]["factors"])
+        core["groups"] = {n: list(GROUP_FACTORS[n]) for n in names if n in GROUP_FACTORS}
+        core["directions"] = {a: bool(ATOMIC_FACTORS[a][0]) for a in _atoms_of(names)}
+    except Exception as e:  # noqa: BLE001      # 팩터가 등록되지 않음(signals 로드 실패 등) → 지문이 달라져 selftest 가 잡는다
+        core["groups"] = f"unavailable: {e}"
+    return hashlib.sha256(json.dumps(core, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+
+
+# 등록 시점의 지문 — 이 값은 고치지 않는다(규칙이 실수로 바뀌면 selftest 가 실패로 알려 준다)
+REG_FINGERPRINTS: dict[str, str] = {"lowpbr": "0a68eec0cbc86c67", "esb": "375fe556015005d1", "earn": "096fd25e2faa367f"}
+
+
+# ── 편입 종목 고정 장부 ──────────────────────────────────────
+LEDGER_NAME = "paper_ledger"
+LEDGER_TEXT = "paper_ledger.json"
+_ledger: dict[str, dict[str, dict[str, Any]]] = {}      # 전략 id -> 편입 월말 -> {"tickers", "top30", "n", "hash", "frozen_at"}
+_ledger_lock = threading.Lock()
+_ledger_state: dict[str, Any] = {"loaded": False, "persisted": None, "last_saved": None, "load_error": None}
+
+
+def _picks_hash(tickers: list[str]) -> str:
+    import hashlib
+    return hashlib.sha256(",".join(sorted(str(t) for t in tickers)).encode()).hexdigest()[:12]
+
+
+def _ledger_merge(stored: dict[str, Any]) -> int:
+    """저장소의 장부를 메모리에 합친다. 같은 (전략, 편입 월말)이 양쪽에 있으면 '저장소 것'이 이긴다(먼저 고정된 기록 우선)."""
+    n = 0
+    with _ledger_lock:
+        for sid, book in (stored or {}).items():
+            mine = _ledger.setdefault(str(sid), {})
+            for d, rec in (book or {}).items():
+                if isinstance(rec, dict) and rec.get("tickers"):
+                    if mine.get(str(d), {}).get("hash") != rec.get("hash"):
+                        n += 1
+                    mine[str(d)] = rec
+    return n
+
+
+def ledger_load() -> int:
+    """저장소에서 장부를 읽어 메모리에 합친다. 반환: 합친 코호트 수, 읽을 수 없으면 −1.
+    '장부가 아직 없음'(새로 시작)과 '있는데 읽지 못함'(네트워크 오류)을 구분한다 — 뒤의 경우 loaded=False 로 두어
+    그 상태에서는 새 편입을 고정하거나 저장하지 않는다(읽지 못한 기존 장부를 빈 장부로 덮어쓰는 사고 방지)."""
+    if cachestore is None:
+        _ledger_state.update(loaded=True, load_error=None)
+        return 0
+    obj = cachestore.load(LEDGER_NAME)
+    if obj and isinstance(obj, dict) and isinstance(obj.get("ledger"), dict):
+        n = _ledger_merge(obj["ledger"])
+        _ledger_state.update(loaded=True, load_error=None, last_saved=obj.get("saved_at"))
+        return n
+    ex = None
+    try:
+        ex = cachestore.exists(LEDGER_NAME)
+    except Exception as e:  # noqa: BLE001
+        log.warning("장부 존재 확인 실패: %s", e)
+    if ex is False:                              # 확실히 없음 → 새 장부로 시작
+        _ledger_state.update(loaded=True, load_error=None)
+        return 0
+    _ledger_state.update(loaded=False, load_error="저장소에 장부가 있는데 읽지 못했거나 저장소를 확인할 수 없음")
+    return -1
+
+
+def ledger_save() -> bool:
+    """장부를 저장소에 올린다: pickle(복구용) + 사람이 읽는 JSON(릴리스 자산 paper_ledger.json).
+    올리기 전에 저장소의 현재 장부를 다시 읽어 합친다(같은 편입 월말은 먼저 고정된 저장소 기록이 우선)."""
+    if cachestore is None:
+        _ledger_state["persisted"] = False
+        return False
+    import json
+    cur = cachestore.load(LEDGER_NAME)
+    if cur and isinstance(cur, dict) and isinstance(cur.get("ledger"), dict):
+        _ledger_merge(cur["ledger"])
+    else:
+        ex = None
+        try:
+            ex = cachestore.exists(LEDGER_NAME)
+        except Exception as e:  # noqa: BLE001
+            log.warning("장부 존재 확인 실패: %s", e)
+        if ex is not False:                      # 있는데 못 읽었거나 확인 불가 → 덮어쓰지 않는다
+            _ledger_state["persisted"] = False
+            _ledger_state["load_error"] = "저장 보류: 저장소의 기존 장부를 읽지 못함(다음 호출 때 다시 시도)"
+            return False
+    with _ledger_lock:
+        snap = {sid: {d: dict(rec) for d, rec in book.items()} for sid, book in _ledger.items()}
+    saved_at = _today().strftime("%Y-%m-%d %H:%M:%S")
+    ok = cachestore.save(LEDGER_NAME, {"version": 1, "saved_at": saved_at, "ledger": snap})
+    try:
+        human = {"설명": "표본 외(paper) 검증 편입 종목 장부. 편입 월말마다 처음 계산한 종목을 고정해 기록한다(이후 자료가 정정돼도 바뀌지 않음). "
+                         "hash 는 종목코드를 정렬해 이은 문자열의 sha256 앞 12자.",
+                 "saved_at_kst": saved_at,
+                 "strategies": {sid: {"name": REGISTRATIONS.get(sid, {}).get("name"),
+                                      "cohorts": {d: snap[sid][d] for d in sorted(snap[sid])}} for sid in sorted(snap)}}
+        cachestore.save_text(LEDGER_TEXT, json.dumps(human, ensure_ascii=False, indent=1))
+    except Exception as e:  # noqa: BLE001
+        log.warning("장부 JSON 저장 실패(무시): %s", e)
+    _ledger_state["persisted"] = bool(ok)
+    if ok:
+        _ledger_state["last_saved"] = saved_at
+        _ledger_state["load_error"] = None
+    return bool(ok)
+
+
+def _apply_ledger(sid: str, reg: dict[str, Any], sel: pd.DataFrame, sel30: pd.DataFrame | None, dates: list[str],
+                  can_freeze: bool) -> dict[str, Any]:
+    """표본 외 편입 월말의 선정 결과를 장부로 고정한다.
+    이미 고정된 달은 (다시 계산한 값이 달라도) 장부의 종목으로 덮어쓰고, 새 달은 can_freeze 일 때 지금 계산한 종목을 장부에 적는다."""
+    if not _ledger_state["loaded"]:
+        try:
+            ledger_load()
+        except Exception as e:  # noqa: BLE001
+            log.warning("장부 복구 실패(무시): %s", e)
+    cols = sel.columns
+    colpos = {t: i for i, t in enumerate(cols)}
+    info: dict[str, Any] = {"frozen": [], "newly_frozen": [], "recompute_mismatch": {}}
+    if not _ledger_state["loaded"]:
+        # 저장소의 장부를 읽지 못한 상태: 이번 계산은 고정하지 않는다(기존 기록을 모르는 채로 새 기록을 만들면 덮어쓰게 됨)
+        can_freeze = False
+        info["unavailable"] = _ledger_state.get("load_error") or "장부를 읽지 못함"
+    stamp = _today().strftime("%Y-%m-%d %H:%M")
+    with _ledger_lock:
+        book = _ledger.setdefault(sid, {})
+        for d in dates:
+            if d < reg["oos_first_formation"]:
+                continue
+            now_t = [str(t) for t in cols[sel.loc[d].to_numpy(dtype=bool)]]
+            rec = book.get(d)
+            if rec is not None:
+                led = [t for t in rec["tickers"] if t in colpos]
+                if set(led) != set(now_t):
+                    info["recompute_mismatch"][d] = {"frozen_n": len(led), "recomputed_n": len(now_t), "overlap": len(set(led) & set(now_t))}
+                    row = np.zeros(len(cols), dtype=bool)
+                    row[[colpos[t] for t in led]] = True
+                    sel.loc[d] = row
+                if sel30 is not None and rec.get("top30"):
+                    row = np.zeros(len(cols), dtype=bool)
+                    row[[colpos[t] for t in rec["top30"] if t in colpos]] = True
+                    sel30.loc[d] = row
+                info["frozen"].append(d)
+            elif can_freeze and now_t:
+                book[d] = {"tickers": now_t, "n": len(now_t), "hash": _picks_hash(now_t), "frozen_at": stamp,
+                           "top30": ([str(t) for t in cols[sel30.loc[d].to_numpy(dtype=bool)]] if sel30 is not None else None)}
+                info["newly_frozen"].append(d)
+                info["frozen"].append(d)
+    if info["newly_frozen"]:
+        try:
+            ledger_save()
+        except Exception as e:  # noqa: BLE001
+            log.warning("장부 저장 실패(무시): %s", e)
+    info["persisted"] = _ledger_state.get("persisted")
+    if info["frozen"] and not info["newly_frozen"] and info["persisted"] is None:
+        info["persisted"] = True                  # 이번에 새로 적은 것 없이 저장소에서 읽어 온 기록만 사용
+    return info
+
+
+def ledger_status() -> dict[str, Any]:
+    """장부 요약: 전략별 고정된 코호트(편입 월말·종목 수·hash·고정 시각)."""
+    if not _ledger_state["loaded"]:
+        try:
+            ledger_load()
+        except Exception as e:  # noqa: BLE001
+            log.warning("장부 복구 실패(무시): %s", e)
+    with _ledger_lock:
+        out = {sid: [{"formation": d, "n": rec.get("n", len(rec.get("tickers", []))), "hash": rec.get("hash"),
+                      "frozen_at": rec.get("frozen_at"), "top30_n": len(rec.get("top30") or [])}
+                     for d, rec in sorted(book.items())] for sid, book in _ledger.items()}
+    return {"ok": True, "strategies": out, "persisted": _ledger_state.get("persisted"), "last_saved": _ledger_state.get("last_saved"),
+            "loaded": bool(_ledger_state.get("loaded")), "load_error": _ledger_state.get("load_error"),
+            "store": cachestore.status(LEDGER_NAME) if cachestore is not None else {"enabled": False},
+            "note": "편입 월말마다 처음 계산한 종목을 고정한 기록. GitHub 저장소의 'cache' 릴리스에 paper_ledger.json(사람이 읽는 사본)으로도 올라갑니다. "
+                    "hash 는 월간 보고의 값과 같아야 합니다."}
+
+
+def _reg_public(reg: dict[str, Any]) -> dict[str, Any]:
+    return {k2: v for k2, v in reg.items() if k2 not in ("in_sample_window", "in_sample_last_return", "needs")}
+
+
+def _paper_select(reg: dict[str, Any], P: dict[str, pd.DataFrame], mask: pd.DataFrame
+                  ) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None, dict[str, pd.DataFrame]]:
+    """등록 규칙대로 월말별 편입 종목 표(sel)를 만든다. 반환: (sel, 상위30 참고 sel, 점수 패널, 팩터별 순위)."""
     prm = reg["params"]
+    if reg.get("id") == "lowpbr":             # 2026-11-07 등록 규칙 그대로(이 분기는 고치지 않는다)
+        bm = 1.0 / P["pbr"].where(P["pbr"] > 0)
+        order = (-bm.where(mask)).rank(axis=1, method="first")
+        return (order <= int(prm["top_n"])) & mask, None, None, {}
+    names = _parse_factors(prm["factors"])
+    F = raw_factors(P, only=_atoms_of(names))
+    R = factor_ranks(F, names, mask)
+    comp = composite_rank(R, names, mask)
+    if int(prm.get("top_n") or 0) > 0:
+        sel = ((-comp).rank(axis=1, method="first") <= int(prm["top_n"])) & mask
+    else:
+        sel = (comp > (1.0 - float(prm["top_pct"]) / 100.0)) & mask
+    sel30 = ((-comp).rank(axis=1, method="first") <= 30) & mask
+    return sel, sel30, comp, R
+
+
+def _rows_net(rows: list[list[Any]], cost_by_month: dict[str, float]) -> dict[str, Any]:
+    """월별 비용(소수)을 뺀 비용 후 요약."""
+    if not rows:
+        return {}
+    port = pd.Series([r[2] for r in rows], dtype=float)
+    uni = pd.Series([r[3] for r in rows], dtype=float)
+    c = pd.Series([float(cost_by_month.get(r[0], 0.0) or 0.0) for r in rows], dtype=float)
+    pn = port - c
+    return {"avg_month_cost_pp": round(float(c.mean()) * 100, 3), "net_excess_vs_universe_pp": round(float((pn - uni).mean()) * 100, 2),
+            "net_hit_rate_vs_universe_pct": round(float(((pn - uni) > 0).mean()) * 100, 1),
+            "net_cum_port_pct": round((float(np.prod(1 + pn)) - 1) * 100, 1)}
+
+
+def _paper_latest_ready() -> dict[str, Any] | None:
+    """직전 완료 달의 월말 스냅샷이 없으면 받아온다. 수집 중이면 preparing 응답(dict), 준비됐으면 None."""
     if _state["running"]:
         st = dict(_state)
-        return {"ok": False, "status": "preparing", "message": f"월말 데이터를 받는 중입니다 ({st['done']}/{st['target']}). 몇 분 뒤 다시 실행하세요.",
-                "registration": reg}
-    # 직전 완료 달의 월말이 아직 없으면 받아온다(월초 자동 실행 대비, KRX 3회 + 지수 1회)
+        return {"ok": False, "status": "preparing",
+                "message": f"월말 데이터를 받는 중입니다 ({st['done']}/{st['target']}). 몇 분 뒤 다시 실행하세요."}
     y, m = _last_complete_month()
     me = _month_end.get((y, m), "?")
     if me == "?" or (me is not None and me not in _snaps):
@@ -1544,41 +2229,124 @@ def run_paper_test(show_all_cohorts: bool = False) -> dict[str, Any]:
             ensure_months(int(round(DEFAULT_YEARS * 12)) + WARMUP_MONTHS)
         except Exception as e:  # noqa: BLE001
             log.warning("paper_test: 최신 월말 수집 실패: %s", e)
+    return None
+
+
+def run_paper_test(show_all_cohorts: bool = False, strategy: str = "lowpbr", holdings_limit: int = 30) -> dict[str, Any]:
+    """사전 등록된 규칙대로 표본 외 코호트를 계산해 보고한다. 규칙 파라미터는 받지 않는다.
+    strategy: lowpbr(기본, 2026-11-07 등록) | esb | earn(2026-11-12 등록) | all(세 전략 요약)."""
+    try:
+        sid = str(strategy or "lowpbr").strip().lower()
+        if sid == "all":
+            return _paper_all(int(holdings_limit))
+        if sid not in REGISTRATIONS:
+            return {"ok": False, "error": f"알 수 없는 전략 '{sid}'. 가능: {', '.join(REGISTRATIONS)} 또는 all"}
+        return _paper_one(sid, bool(show_all_cohorts), int(holdings_limit))
+    finally:
+        _cleanup()
+
+
+def _paper_all(holdings_limit: int = 10) -> dict[str, Any]:
+    out: dict[str, Any] = {"ok": True, "strategies": {}}
+    for sid in REGISTRATIONS:
+        r = _paper_one(sid, False, holdings_limit)
+        if not r.get("ok"):
+            out["strategies"][sid] = {k: r.get(k) for k in ("ok", "status", "message", "missing", "error") if r.get(k) is not None}
+            out["strategies"][sid]["name"] = REGISTRATIONS[sid]["name"]
+            continue
+        latest = r["cohorts"][-1] if r.get("cohorts") else None
+        item = {"ok": True, "name": REGISTRATIONS[sid]["name"], "status": r["status"], "as_of_month_end": r["as_of_month_end"],
+                "verdict_month": REGISTRATIONS[sid]["verdict_month"], "oos_summary": r["oos_summary"],
+                "in_sample_reproduction": {k: r["in_sample_reproduction"].get(k) for k in
+                                           ("months", "excess_vs_universe_pp", "excess_t_stat", "hit_rate_vs_universe_pct")},
+                "latest_cohort": None if latest is None else {k: latest.get(k) for k in ("formation", "n", "hash", "frozen_at", "holdings")
+                                                              if latest.get(k) is not None}}
+        if r.get("secondary_top30"):
+            item["secondary_top30_oos"] = r["secondary_top30"].get("oos_summary")
+        out["strategies"][sid] = item
+    out["note"] = "전략별 상세는 paper_test(strategy=\"lowpbr\"|\"esb\"|\"earn\"). 사전 등록된 규칙을 그대로 적용한 기록이며 매매 권유가 아닙니다."
+    return out
+
+
+def _paper_one(sid: str, show_all_cohorts: bool = False, holdings_limit: int = 30) -> dict[str, Any]:
+    t0 = time.time()
+    reg = REGISTRATIONS[sid]
+    prm = reg["params"]
+    legacy = sid == "lowpbr"
+    reg_out = {k2: v for k2, v in reg.items() if k2 != "in_sample_window"} if legacy else _reg_public(reg)
+    prep = _paper_latest_ready()
+    if prep is not None:
+        return {**prep, "registration": reg if legacy else reg_out}
     with _lock:
         dates = sorted(_snaps)
     if len(dates) < 2:
-        return {"ok": False, "error": "월말 데이터가 없습니다. factor_cache_status 확인.", "registration": reg}
+        return {"ok": False, "error": "월말 데이터가 없습니다. factor_cache_status 확인.", "registration": reg if legacy else reg_out}
+
+    # 편입 시점 자료 준비 확인(DART·공매도 신호를 쓰는 등록만): 가장 최근 편입 월말이 아직 장부에 없을 때
+    needs = reg.get("needs") or {}
+    can_freeze = True
+    latest = dates[-1]
+    if needs and latest >= reg["oos_first_formation"]:
+        if not _ledger_state["loaded"]:
+            try:
+                ledger_load()
+            except Exception as e:  # noqa: BLE001
+                log.warning("장부 복구 실패(무시): %s", e)
+        if latest not in _ledger.get(sid, {}):
+            fn = PAPER_READY.get("fn")
+            r = fn(latest, bool(needs.get("dart")), bool(needs.get("short"))) if fn is not None else \
+                {"ok": False, "fatal": True, "message": "signals 모듈이 로드되지 않아 이 전략을 계산할 수 없습니다."}
+            if not r.get("ok"):
+                return {"ok": False, "status": "error" if r.get("fatal") else "preparing", "strategy": sid,
+                        "message": r.get("message"), "missing": r.get("missing"), "last_error": r.get("last_error"),
+                        "as_of_month_end": latest, "registration": reg_out,
+                        "hint": "자료 수집이 끝나면 같은 호출을 다시 하세요(보통 5~10분). 진행은 signals_cache_status 로 확인."}
+
     P = _panels(dates)
     mask = _universe_mask(P, float(prm["min_cap_eok"]) * 1e8, bool(prm["exclude_managed"]), float(prm["min_price"]), True)
     ret, _van = _apply_delisting(P, DEFAULT_DELIST_PCT)
-    bm = 1.0 / P["pbr"].where(P["pbr"] > 0)
-    order = (-bm.where(mask)).rank(axis=1, method="first")
-    sel = (order <= int(prm["top_n"])) & mask
+    sel, sel30, comp, R = _paper_select(reg, P, mask)
+    led = _apply_ledger(sid, reg, sel, sel30, dates, can_freeze)
     kospi_m, kosdaq_m = _index_monthly(dates)
     kflag = (P["kosdaq"].ffill().iloc[-1] > 0).to_numpy()      # 종목별 시장 구분(최신 행 기준; 이전·상폐 종목은 마지막 값)
     k = int(prm["hold_months"])
-    month_cost = (DEFAULT_COST_PCT / 100.0) / k                  # 매달 1/k 코호트 교체 → 왕복 비용의 1/k
+    last_ins = reg.get("in_sample_last_return", "20261030")
+    n_verdict = int(reg.get("verdict_months", 24))
 
-    oos_rows = _overlap_port(sel, ret, mask, dates, k, reg["oos_first_formation"], dates[-1], kflag, kospi_m, kosdaq_m)
-    oos = _rows_summary(oos_rows, nw_lags=k - 1, month_cost=month_cost)
+    def _summ(sel_df: pd.DataFrame, f_from: str, f_to: str, upto: str | None) -> tuple[list[list[Any]], dict[str, Any]]:
+        rows = _overlap_port(sel_df, ret, mask, dates, k, f_from, f_to, kflag, kospi_m, kosdaq_m)
+        if upto is not None:
+            rows = [r for r in rows if r[0] <= upto]
+        if legacy:
+            return rows, _rows_summary(rows, nw_lags=k - 1, month_cost=(DEFAULT_COST_PCT / 100.0) / k)   # 매달 1/k 코호트 교체 → 왕복 비용의 1/k
+        summ = _rows_summary(rows, nw_lags=k - 1)
+        if rows:
+            turn = _turnover(sel_df, k) * (DEFAULT_COST_PCT / 100.0)           # 편입 월말 기준 실제 교체율 × 왕복 비용
+            cost_by_month = _to_return_month(turn, dates, 1).fillna((DEFAULT_COST_PCT / 100.0) / k).to_dict()
+            summ["cost"] = _rows_net(rows, cost_by_month)
+        return rows, summ
+
+    oos_rows, oos = _summ(sel, reg["oos_first_formation"], dates[-1], None)
     f0, f1 = reg["in_sample_window"]
-    ins_rows = _overlap_port(sel, ret, mask, dates, k, f0, f1, kflag, kospi_m, kosdaq_m)
-    ins_rows = [r for r in ins_rows if r[0] <= "20261030"]            # 표본 내 수익률월은 2026-10 까지
-    ins = _rows_summary(ins_rows, nw_lags=k - 1, month_cost=month_cost)
+    _ins_rows, ins = _summ(sel, f0, f1, last_ins)
 
     # 판정 미리보기(판정월 전에는 '진행 중')
     n = oos["months"]
     latest_ret_month = oos_rows[-1][0] if oos_rows else None
     verdict = "진행 중"
+    if not legacy and latest < reg["oos_first_formation"]:
+        verdict = f"대기 중 — 첫 편입은 {reg['oos_first_formation']} 종가, 표본 외 수익률은 {reg['oos_first_return_month']} 부터"
     if n:
         ex, hit = oos["excess_vs_universe_pp"], oos["hit_rate_vs_universe_pct"]
         prelim = "통과" if (ex >= 0.3 and hit >= 55) else ("기각" if ex <= 0 else "연장(12개월 후 재판정)")
         final = latest_ret_month is not None and f"{latest_ret_month[:4]}-{latest_ret_month[4:6]}" >= reg["verdict_month"]
-        verdict = f"판정: {prelim}" if final else f"진행 중 {n}/24개월 (지금 규칙을 적용하면 '{prelim}' — 판정은 {reg['verdict_month']} 수익률 반영 후)"
+        verdict = f"판정: {prelim}" if final else f"진행 중 {n}/{n_verdict}개월 (지금 규칙을 적용하면 '{prelim}' — 판정은 {reg['verdict_month']} 수익률 반영 후)"
 
     names = _names_latest[1] if _names_latest else {}
     cohorts_out = []
     pos = {d: i for i, d in enumerate(dates)}
+    book = _ledger.get(sid, {})
+    fnames = [] if legacy else _parse_factors(prm["factors"])
     for d in dates:
         if d < reg["oos_first_formation"]:
             continue
@@ -1594,17 +2362,38 @@ def run_paper_test(show_all_cohorts: bool = False) -> dict[str, Any]:
             cum = round((float(np.prod(1 + r.mean(axis=1).fillna(0))) - 1) * 100, 2)
         entry = {"formation": d, "n": len(tick), "months_held": held, "cum_return_pct": cum,
                  "exit_after": dates[i + k] if i + k < len(dates) else f"{k}개월 뒤"}
-        if show_all_cohorts or d == dates[-1]:
-            entry["holdings"] = [{"code": t, "name": names.get(t, t), "entry_close": _num_or_none(P["close"].loc[d, t], 0),
-                                  "PBR": _num_or_none(P["pbr"].loc[d, t], 2), "cap_억": _num_or_none(P["cap"].loc[d, t], 0, 1e-8),
-                                  "market": "KOSDAQ" if P["kosdaq"].loc[d, t] > 0 else "KOSPI"} for t in tick]
+        rec = book.get(d)
+        if rec is not None:
+            entry["hash"], entry["frozen_at"] = rec.get("hash"), rec.get("frozen_at")
+        show = show_all_cohorts or d == dates[-1]
+        if legacy:
+            if show:
+                entry["holdings"] = [{"code": t, "name": names.get(t, t), "entry_close": _num_or_none(P["close"].loc[d, t], 0),
+                                      "PBR": _num_or_none(P["pbr"].loc[d, t], 2), "cap_억": _num_or_none(P["cap"].loc[d, t], 0, 1e-8),
+                                      "market": "KOSDAQ" if P["kosdaq"].loc[d, t] > 0 else "KOSPI"} for t in tick]
+            else:
+                entry["codes"] = tick
         else:
-            entry["codes"] = tick
+            sc = comp.loc[d].reindex(tick)
+            order = list(sc.sort_values(ascending=False, kind="mergesort").index)       # 점수 높은 순(동점은 코드 순 유지)
+            entry["codes"] = order
+            if show:
+                lim = len(order) if int(holdings_limit) <= 0 else int(holdings_limit)
+                entry["holdings"] = [{"code": t, "name": names.get(t, t), "market": "KOSDAQ" if P["kosdaq"].loc[d, t] > 0 else "KOSPI",
+                                      "entry_close": _num_or_none(P["close"].loc[d, t], 0), "cap_억": _num_or_none(P["cap"].loc[d, t], 0, 1e-8),
+                                      "score_pct": _num_or_none(sc.get(t, np.nan), 1, 100),
+                                      "ranks_pct": {f: _num_or_none(R[f].loc[d, t], 1, 100) for f in fnames} if len(fnames) > 1 else None,
+                                      "PBR": _num_or_none(P["pbr"].loc[d, t], 2)} for t in order[:lim]]
+                entry["holdings_shown"] = f"점수 상위 {min(lim, len(order))}/{len(order)}종목 (전체 코드는 codes, holdings_limit=0 이면 전부)"
+                if sel30 is not None:
+                    t30 = sel30.loc[d]
+                    s30 = comp.loc[d].reindex(list(t30.index[t30.to_numpy()])).sort_values(ascending=False, kind="mergesort")
+                    entry["top30_codes"] = list(s30.index)
         cohorts_out.append(entry)
 
-    return {
+    out: dict[str, Any] = {
         "ok": True,
-        "registration": {k2: v for k2, v in reg.items() if k2 != "in_sample_window"},
+        "registration": reg_out,
         "as_of_month_end": dates[-1],
         "status": verdict,
         "oos_summary": oos,
@@ -1612,13 +2401,34 @@ def run_paper_test(show_all_cohorts: bool = False) -> dict[str, Any]:
         "oos_monthly": [[f"{r[0][:4]}-{r[0][4:6]}", r[1], round(r[2] * 100, 2), round(r[3] * 100, 2),
                          None if (r[4] is None or np.isnan(r[4])) else round(r[4] * 100, 2), round(r[5] * 100, 2)] for r in oos_rows],
         "cohorts": cohorts_out,
-        "in_sample_reproduction": {"note": "현재 캐시로 표본 내 구간을 현행 방법(v1.4: 상폐 −50%·거래정지 제외·NW t·비용 병기)으로 다시 계산한 값. "
-                                           "registration.in_sample_reference(구방법 +0.61%p·t 1.77)보다 조금 낮게 나오는 것이 정상이며, "
-                                           "배포 간에 이 값이 흔들리면 데이터 이상",
-                                   **ins},
-        "elapsed_sec": round(time.time() - t0, 1),
-        "note": "사전 등록된 규칙을 그대로 적용한 기록입니다. 규칙을 바꾸지 마세요. 과거·현재 통계이며 매매 권유가 아닙니다.",
     }
+    if legacy:
+        out["in_sample_reproduction"] = {"note": "현재 캐시로 표본 내 구간을 현행 방법(v1.4: 상폐 −50%·거래정지 제외·NW t·비용 병기)으로 다시 계산한 값. "
+                                                 "registration.in_sample_reference(구방법 +0.61%p·t 1.77)보다 조금 낮게 나오는 것이 정상이며, "
+                                                 "배포 간에 이 값이 흔들리면 데이터 이상",
+                                         **ins}
+    else:
+        out["strategy"] = sid
+        out["in_sample_reproduction"] = {"note": "현재 캐시·현행 자료 정의(v1.7: 공매도 T−2, 공시 접수 다음 날 반영)로 표본 내 구간(형성 "
+                                                 f"{f0[:4]}-{f0[4:6]} ~ {f1[:4]}-{f1[4:6]})을 다시 계산한 값. 등록 근거(in_sample_reference, v1.6 정의)와 "
+                                                 "조금 다를 수 있으며, 배포 간에 이 값이 흔들리면 데이터 이상", **ins}
+        if sel30 is not None:
+            o30_rows, o30 = _summ(sel30, reg["oos_first_formation"], dates[-1], None)
+            _i30_rows, i30 = _summ(sel30, f0, f1, last_ins)
+            out["secondary_top30"] = {"note": "같은 점수의 상위 30종목 버전(참고용, 판정 미사용)", "oos_summary": o30,
+                                      "in_sample_reproduction": i30}
+        warn = _warnings()
+        if warn:
+            out["warnings"] = warn
+    out["ledger"] = {"frozen_cohorts": len(led["frozen"]), "newly_frozen": led["newly_frozen"], "persisted": led.get("persisted"),
+                     "unavailable": led.get("unavailable"),
+                     "recompute_mismatch": led["recompute_mismatch"] or None,
+                     "note": "편입 종목은 처음 계산한 값으로 고정됩니다. recompute_mismatch 가 있으면 이후 자료가 정정된 것(보고는 고정값 기준)."}
+    if legacy:
+        out["other_registrations"] = {s2: REGISTRATIONS[s2]["name"] for s2 in REGISTRATIONS if s2 != sid}
+    out["elapsed_sec"] = round(time.time() - t0, 1)
+    out["note"] = "사전 등록된 규칙을 그대로 적용한 기록입니다. 규칙을 바꾸지 마세요. 과거·현재 통계이며 매매 권유가 아닙니다."
+    return out
 
 
 def _num_or_none(x, nd: int = 2, scale: float = 1.0):
@@ -1629,5 +2439,9 @@ try:
     load_cache()                 # 볼륨이 있으면 지난 월말 스냅샷을 먼저 복구(없는 달만 받게 됨)
 except Exception as _e:  # noqa: BLE001
     log.warning("factors 캐시 복구 중 오류(무시): %s", _e)
+try:
+    ledger_load()                # 표본 외 편입 종목 장부
+except Exception as _e:  # noqa: BLE001
+    log.warning("장부 복구 중 오류(무시): %s", _e)
 if os.environ.get("FACTOR_PREFETCH", "1") != "0":
     prefetch()
